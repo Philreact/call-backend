@@ -1,0 +1,100 @@
+name: qapp-backend-call
+
+services:
+  network:
+    build:
+      context: .
+      target: network-runtime
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --state-file
+      - /data/network/reachability.json
+      - --public-host
+      - ${QAPP_BACKEND_PUBLIC_HOST:-}
+      - --upnp=${QAPP_BACKEND_UPNP:-true}
+      - --port
+      - ${PRIVATE_TRANSPORT_PORT:-4445}
+      - --port
+      - ${CALL_MEDIA_PORT:-4446}
+    volumes:
+      - network-data:/data/network
+    healthcheck:
+      test: ["CMD", "qapp-backend-network", "--health", "--state-file", "/data/network/reachability.json"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 10s
+
+  backend:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      network:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["--config", "/app/config.toml"]
+    environment:
+      BACKEND_PRODUCTION_DEPLOYMENT: local
+      BACKEND_BACKUP_PATH: /data/backups
+      BACKEND_INSTANCE_LOCK_PATH: /data/backend/instance.lock
+      PRIVATE_TRANSPORT_BIND_HOST: 0.0.0.0
+      PRIVATE_TRANSPORT_PUBLIC_HOST: ${PRIVATE_TRANSPORT_PUBLIC_HOST:-auto}
+      PRIVATE_TRANSPORT_PORT: ${PRIVATE_TRANSPORT_PORT:-4445}
+      PRIVATE_TRANSPORT_CERT_PATH: /data/backend/private-transport-cert.pem
+      PRIVATE_TRANSPORT_KEY_PATH: /data/backend/private-transport-key.pem
+      BACKEND_NETWORK_STATE_PATH: /data/network/reachability.json
+      CALL_MEDIA_PUBLIC_HOST: ${CALL_MEDIA_PUBLIC_HOST:-auto}
+      CALL_MEDIA_PORT: ${CALL_MEDIA_PORT:-4446}
+      CALL_MEDIA_GRANTS_PATH: /data/backend/call-media-grants
+      CALL_MEDIA_REVOCATIONS_PATH: /data/backend/call-media-revocations
+    healthcheck:
+      test: ["CMD", "qapp-backend-call", "--config", "/app/config.toml", "--health"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - reticulum-data:/data/reticulum
+      - backend-data:/data/backend
+      - backup-data:/data/backups
+      - network-data:/data/network:ro
+    ports:
+      - "${PRIVATE_TRANSPORT_PORT:-4445}:${PRIVATE_TRANSPORT_PORT:-4445}/udp"
+    stop_grace_period: 20s
+
+  media:
+    build:
+      context: .
+      target: media-runtime
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    command:
+      - --listen
+      - 0.0.0.0:4446
+      - --certificate
+      - /data/backend/private-transport-cert.pem
+      - --key
+      - /data/backend/private-transport-key.pem
+      - --grants
+      - /data/backend/call-media-grants
+      - --revocations
+      - /data/backend/call-media-revocations
+    volumes:
+      - backend-data:/data/backend
+    ports:
+      - "${CALL_MEDIA_PORT:-4446}:${CALL_MEDIA_PORT:-4446}/udp"
+    stop_grace_period: 10s
+
+volumes:
+  reticulum-data:
+  backend-data:
+  backup-data:
+  network-data:

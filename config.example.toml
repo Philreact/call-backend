@@ -1,0 +1,30 @@
+[backend]
+production_deployment = "local"
+rns_config_dir = "data/reticulum"
+data_dir = "data/backend"
+identity_path = "data/backend/identity"
+database_path = "data/backend/backend.sqlite3"
+backup_path = "data/backups"
+log_level = "INFO"
+
+enforce_qapp_allowlist = false
+allowed_qapps = [{ name = "qapp-ui-call", service = "APP" }]
+
+private_transport_bind_host = "127.0.0.1"
+private_transport_public_host = "127.0.0.1"
+private_transport_port = 4445
+private_transport_server_name = "qapp-call-private-backend"
+private_transport_cert_path = "data/backend/private-transport-cert.pem"
+private_transport_key_path = "data/backend/private-transport-key.pem"
+call_media_public_host = "127.0.0.1"
+call_media_port = 4446
+call_media_grants_path = "data/backend/call-media-grants"
+call_media_revocations_path = "data/backend/call-media-revocations"
+
+# Set access_mode to "groups" to require membership in at least one listed
+# Qortal group. Prefer a local Core URL and keep remote HTTPS URLs as backups.
+access_mode = "public"
+allowed_group_ids = []
+core_url_bases = []
+access_revalidate_interval = 1800
+access_outage_grace = 3600

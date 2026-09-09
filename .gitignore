@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+dist/
+build/
+data/
+secrets/
+config.toml
+config.dev.toml
+/.env
+/0/
+/.qapp-backend-call-instance.lock
