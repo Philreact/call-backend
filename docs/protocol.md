@@ -20,8 +20,25 @@ For a Q-App isolation key and destination, Desktop pools one physical Link.
 Reticulum `link.request()` RPC and realtime Channel/Buffer traffic MUST coexist
 on that Link. Realtime uses `link.get_channel()` and bidirectional RNS Buffer
 stream ID **7**. Writers MUST handle partial writes until the entire frame has
-been accepted, then flush. A new Link always gets new Channel, reader, writer,
+been accepted. The backend uses `RawChannelWriter` directly: there are no Python
+buffered bytes to flush. A new Link always gets new Channel, reader, writer,
 and parser objects.
+
+Backend writes have a ten-second total deadline covering serialization-lock
+wait, worker-queue wait, and partial writes. Zero-byte writes retry briefly
+until that deadline. Eight daemon workers and a 64-job queue bound resource use
+even if an underlying RNS call never returns; queued expired jobs cannot send.
+If all workers remain stuck, new sends fail within the deadline rather than
+spawning unlimited threads. A process restart may be needed in that exceptional
+case, since Python cannot forcibly terminate a blocked native call.
+
+A failed or timed-out write cancels that physical writer and closes its
+connection; partial frames are never followed by new frames on that stream.
+Link teardown is best effort on a separate bounded worker pool. Connection
+state locks are not held during writes, so ACK processing and close remain
+available. Replacement Links have independent writers and cancellation state.
+These changes do not alter framing, identity proofs, group checks, or reconnect
+authentication requirements.
 
 ## Frame format
 

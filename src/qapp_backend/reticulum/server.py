@@ -19,6 +19,7 @@ from qapp_backend.reticulum.protocol import DataEnvelope
 from qapp_backend.reticulum.realtime import MessageContext
 from qapp_backend.reticulum.rpc import RpcContext, RpcRouter
 from qapp_backend.reticulum.sessions import SessionManager
+from qapp_backend.reticulum.writer import ReticulumWriter, schedule_teardown
 from qapp_backend.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -29,17 +30,8 @@ BUFFER_STREAM_ID = 7
 
 
 def write_all_buffer(writer: Any, data: bytes, timeout: float = 10.0) -> None:
-    offset = 0
-    deadline = time.monotonic() + timeout
-    while offset < len(data):
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Buffer write timed out")
-        written = int(writer.write(data[offset:]) or 0)
-        if written <= 0:
-            time.sleep(0.01)
-            continue
-        offset += written
-    writer.flush()
+    """Compatibility helper for raw (not buffered) Channel writers."""
+    ReticulumWriter(writer, timeout)(data)
 
 
 class QAppServer:
@@ -193,10 +185,9 @@ class QAppServer:
             link.teardown()
             return
         channel = link.get_channel()
-        buffer_writer = __import__("RNS").Buffer.create_writer(BUFFER_STREAM_ID, channel)
-
-        def write(data: bytes) -> None:
-            write_all_buffer(buffer_writer, data)
+        from RNS.Buffer import RawChannelWriter
+        buffer_writer = RawChannelWriter(BUFFER_STREAM_ID, channel)
+        write = ReticulumWriter(buffer_writer)
 
         connection = PhysicalConnection(
             write,
@@ -221,7 +212,7 @@ class QAppServer:
                 logger.exception("Buffer receive failed", extra={"connection_id": connection.id})
                 connection.close("buffer_receive_failed")
                 try:
-                    link.teardown()
+                    schedule_teardown(link)
                 except Exception:
                     pass
 

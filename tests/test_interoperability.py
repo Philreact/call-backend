@@ -38,7 +38,7 @@ def test_buffer_stream_and_partial_write_are_desktop_compatible():
     write_all_buffer(writer, b"0123456789")
     assert BUFFER_STREAM_ID == 7
     assert bytes(writer.output) == b"0123456789"
-    assert writer.flushed
+    assert not writer.flushed  # Raw writes do not need BufferedWriter.flush().
 
 
 def test_rpc_and_realtime_share_one_physical_connection(config):

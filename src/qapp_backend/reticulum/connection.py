@@ -12,6 +12,7 @@ from typing import Any, Callable
 from qapp_backend.config import Config
 from qapp_backend.reticulum.errors import BackpressureError, ConnectionClosedError, ProtocolError
 from qapp_backend.reticulum.framing import Frame, FrameParser, FrameType
+from qapp_backend.reticulum.writer import schedule_teardown
 from qapp_backend.reticulum.protocol import (
     ControlMessage,
     ControlType,
@@ -131,9 +132,17 @@ class PhysicalConnection:
             pending = PendingMessage(connection_id, encoded, time.monotonic())
             self.pending[message_id] = pending
             self.pending_bytes += len(encoded)
+        try:
             self._write(encoded)
-            self._arm_timeout(message_id, pending)
-            return message_id
+        except Exception:
+            with self._lock:
+                if self.pending.pop(message_id, None) is not None:
+                    self.pending_bytes -= len(encoded)
+            raise
+        with self._lock:
+            if not self.closed and self.pending.get(message_id) is pending:
+                self._arm_timeout(message_id, pending)
+        return message_id
 
     def send_control(self, kind: ControlType, message_id: int) -> None:
         payload = ControlMessage(kind).encode()
@@ -143,7 +152,15 @@ class PhysicalConnection:
         with self._lock:
             if self.closed:
                 raise ConnectionClosedError("physical connection is closed")
+        try:
             self.writer(data)
+        except Exception:
+            self.close("buffer_write_failed")
+            schedule_teardown(self.link)
+            raise
+        with self._lock:
+            if self.closed:
+                raise ConnectionClosedError("physical connection closed during write")
             self.last_activity = time.monotonic()
 
     def _arm_timeout(self, message_id: int, pending: PendingMessage, delay: float | None = None) -> None:
@@ -180,6 +197,9 @@ class PhysicalConnection:
             if self.closed:
                 return
             self.closed = True
+            cancel = getattr(self.writer, "cancel", None)
+            if callable(cancel):
+                cancel()
             self.close_reason = reason
             self.parser.reset()
             for pending in self.pending.values():
@@ -198,8 +218,10 @@ class PhysicalConnection:
 
     def adopt_pending(self, messages: list[tuple[int, str, bytes, float]]) -> None:
         """Resend complete logical frames after the client replaces its Link."""
-        with self._lock:
-            for message_id, connection_id, encoded, created_at in messages:
+        for message_id, connection_id, encoded, created_at in messages:
+            with self._lock:
+                if self.closed:
+                    raise ConnectionClosedError("physical connection is closed")
                 remaining = self.config.ack_timeout - (time.monotonic() - created_at)
                 if remaining <= 0:
                     continue
@@ -210,5 +232,13 @@ class PhysicalConnection:
                 pending = PendingMessage(connection_id, encoded, created_at)
                 self.pending[message_id] = pending
                 self.pending_bytes += len(encoded)
+            try:
                 self._write(encoded)
-                self._arm_timeout(message_id, pending, remaining)
+            except Exception:
+                with self._lock:
+                    if self.pending.pop(message_id, None) is not None:
+                        self.pending_bytes -= len(encoded)
+                raise
+            with self._lock:
+                if not self.closed and self.pending.get(message_id) is pending:
+                    self._arm_timeout(message_id, pending, max(0, self.config.ack_timeout - (time.monotonic() - created_at)))
