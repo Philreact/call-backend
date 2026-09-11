@@ -5,7 +5,11 @@ import logging
 import threading
 from typing import Any, TYPE_CHECKING
 
-from aioquic.asyncio import QuicConnectionProtocol, serve
+from aioquic.asyncio import QuicConnectionProtocol
+from aioquic.asyncio.server import QuicServer
+from aioquic.buffer import Buffer
+from aioquic.quic.packet import pull_quic_header
+from aioquic.quic.retry import QuicRetryTokenHandler
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import (
     ConnectionTerminated,
@@ -37,10 +41,42 @@ logger = logging.getLogger(__name__)
 PROTOCOL_ERROR = 0x100
 ATTACH_REJECTED = 0x101
 PRIVATE_QUIC_IDLE_TIMEOUT_SECONDS = 120.0
+UNAUTHENTICATED_CONNECTION_LIMIT = 256
+ATTACH_DEADLINE_SECONDS = 10.0
+
+
+class AdmissionQuicServer(QuicServer):
+    """Bound new connection state without throttling shared relay addresses.
+
+    aioquic has no pre-allocation admission hook. Keep this small adapter covered
+    by wire-level tests when upgrading aioquic: _protocols is its CID routing map.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.pending: set[PrivateQuicProtocol] = set()
+        self._admission_retry = QuicRetryTokenHandler()
+
+    def datagram_received(self, data: bytes, addr: Any) -> None:
+        try:
+            header = pull_quic_header(
+                Buffer(data=data),
+                host_cid_length=self._configuration.connection_id_length,
+            )
+        except ValueError:
+            return
+        if header.destination_cid not in self._protocols:
+            if len(self.pending) >= UNAUTHENTICATED_CONNECTION_LIMIT:
+                return
+        # Also validate outstanding Retry tokens after load has subsided.
+        self._retry = self._admission_retry if (
+            len(self.pending) >= 64 or header.token
+        ) else None
+        super().datagram_received(data, addr)
 
 
 class PrivateQuicProtocol(QuicConnectionProtocol):
-    def __init__(self, *args: Any, service: "PrivateTransportService", **kwargs: Any) -> None:
+    def __init__(self, *args: Any, service: "PrivateTransportService", admission: AdmissionQuicServer | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.service = service
         self.parser = FrameParser()
@@ -49,6 +85,19 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
         self.peer_address: Any = None
         self._detached = False
         self._attach_attempted = False
+        self._admission = admission
+        if admission is not None:
+            admission.pending.add(self)
+        self._auth_deadline = self._loop.time() + ATTACH_DEADLINE_SECONDS
+        self._auth_timer = self._loop.call_later(
+            ATTACH_DEADLINE_SECONDS, self._fail, ATTACH_REJECTED,
+            "authentication deadline exceeded",
+        )
+
+    def _release_admission(self) -> None:
+        self._auth_timer.cancel()
+        if self._admission is not None:
+            self._admission.pending.discard(self)
 
     def datagram_received(self, data: bytes, addr: Any) -> None:
         if self.peer_address is None:
@@ -67,6 +116,7 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
             self._datagram(event.data)
             return
         if isinstance(event, ConnectionTerminated):
+            self._release_admission()
             self._detach()
 
     def _stream_data(self, event: StreamDataReceived) -> None:
@@ -98,6 +148,8 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
             self._fail(PROTOCOL_ERROR, "invalid private transport frame")
 
     def _attach(self, frame: Frame) -> None:
+        if self._loop.time() >= self._auth_deadline:
+            raise FramingError("authentication deadline exceeded")
         if frame.frame_type != FRAME_ATTACH or frame.payload:
             raise FramingError("ATTACH must be the first frame")
         metadata = frame.metadata_json()
@@ -128,6 +180,7 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
             "datagrams": True,
         }
         self._send_frame(Frame(FRAME_ATTACHED, encode_metadata(response)))
+        self._release_admission()
 
     def _datagram(self, data: bytes) -> None:
         if self.session is None:
@@ -240,14 +293,18 @@ class PrivateQuicServer:
                 configuration.load_cert_chain(
                     self.certificate_path, self.key_path
                 )
-                self._server = loop.run_until_complete(
-                    serve(
-                        self.host,
-                        self.port,
+                def make_server() -> AdmissionQuicServer:
+                    server = AdmissionQuicServer(
                         configuration=configuration,
                         create_protocol=lambda *args, **kwargs: PrivateQuicProtocol(
-                            *args, service=self.service, **kwargs
+                            *args, service=self.service, admission=server, **kwargs
                         ),
+                    )
+                    return server
+
+                _, self._server = loop.run_until_complete(
+                    loop.create_datagram_endpoint(
+                        make_server, local_addr=(self.host, self.port)
                     )
                 )
                 transport = getattr(self._server, "_transport", None)

@@ -218,6 +218,32 @@ call key. If backend access is revoked, unused media credentials are deleted
 and the participant's active media connection is closed through a local-only
 revocation marker.
 
+## QUIC admission protection
+
+Both UDP endpoints reserve at most 256 pending unauthenticated connections each.
+Authentication releases that slot immediately, so established calls do not count
+against this budget. Limits are global rather than per IP: many legitimate users
+can share a MASQUE relay address.
+
+Private transport has a 10-second absolute attachment deadline starting when
+connection state is allocated. Media includes handshake time in the same
+10-second attachment budget, retains its existing five-second MOQT path deadline,
+and uses quic-go's bounded handshake timeout. Keepalive traffic cannot extend
+attachment deadlines. The timers stop after successful authentication.
+
+At 64 pending connections, new unvalidated sources must complete QUIC Retry
+address validation. This adds one round trip under load; ordinary connections
+below this threshold do not incur that extra exchange. Existing connections
+continue to be routed when admission is full. Per-attempt media credential
+rejection logs are suppressed to avoid log amplification.
+
+These are application resource protections, not a guarantee against DDoS or
+bandwidth saturation. Use the hosting provider's upstream UDP DDoS protection.
+These limits currently live in `media/admission.go` and
+`src/qapp_backend/private_transport/quic_server.py`. The latter uses aioquic's
+internal CID routing map; run its wire-level admission tests when upgrading
+aioquic.
+
 ## Verification
 
 ```bash

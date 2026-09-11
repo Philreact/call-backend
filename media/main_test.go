@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,10 +239,18 @@ func connectTestMediaClient(
 
 func TestTwoAuthenticatedClientsBlindForwardDatagram(t *testing.T) {
 	directory := t.TempDir()
-	listener, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	gate := newAdmissionGate()
+	transport := &quic.Transport{Conn: udp, ConnContext: gate.admit, VerifySourceAddress: gate.retry}
+	defer transport.Close()
+	listener, err := transport.Listen(&tls.Config{
 		Certificates: []tls.Certificate{testTLSCertificate(t)},
 		NextProtos:   []string{moqtransport.MOQT18.String()},
-	}, &quic.Config{EnableDatagrams: true})
+	}, mediaServerQUICConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

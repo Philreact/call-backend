@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -340,6 +341,7 @@ func waitForPath(ctx context.Context, session *moqtransport.Session) (string, er
 }
 
 func handleConnection(conn *quic.Conn, grants grantStore, revocations revocationStore, media *broker) {
+	authenticated := guardAttachment(conn)
 	handler := &connectionHandler{broker: media}
 	session, err := moqtransport.NewSession(
 		quicmoq.NewServer(conn), "", moqtransport.WithHandler(handler),
@@ -360,11 +362,13 @@ func handleConnection(conn *quic.Conn, grants grantStore, revocations revocation
 	}
 	principal, err := grants.consume(strings.TrimPrefix(path, "attach/"), time.Now())
 	if err != nil {
-		log.Printf("call media attachment rejected: %v", err)
 		return
 	}
 	if revocations.revoked(principal.LogicalSessionID, time.Now()) {
 		_ = conn.CloseWithError(2, "session revoked")
+		return
+	}
+	if !authenticated() {
 		return
 	}
 	handler.principal = principal
@@ -444,7 +448,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	listener, err := quic.ListenAddr(*listen, tlsConfig, mediaServerQUICConfig())
+	udp, err := net.ListenPacket("udp", *listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer udp.Close()
+	gate := newAdmissionGate()
+	transport := &quic.Transport{Conn: udp, ConnContext: gate.admit, VerifySourceAddress: gate.retry}
+	defer transport.Close()
+	listener, err := transport.Listen(tlsConfig, mediaServerQUICConfig())
 	if err != nil {
 		log.Fatal(err)
 	}
