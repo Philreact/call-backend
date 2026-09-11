@@ -17,6 +17,7 @@ from aioquic.quic.events import (
     ProtocolNegotiated,
     QuicEvent,
     StreamDataReceived,
+    StreamReset,
 )
 
 from qapp_backend.private_transport.framing import (
@@ -81,6 +82,9 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
         self.service = service
         self.parser = FrameParser()
         self.stream_id: int | None = None
+        self._parsers: dict[int, FrameParser] = {}
+        self._ended: set[int] = set()
+        self._replies: dict[str, tuple[int, asyncio.TimerHandle]] = {}
         self.session: Any = None
         self.peer_address: Any = None
         self._detached = False
@@ -112,6 +116,9 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
         if isinstance(event, StreamDataReceived):
             self._stream_data(event)
             return
+        if isinstance(event, StreamReset):
+            self._drop_stream(event.stream_id)
+            return
         if isinstance(event, DatagramFrameReceived):
             self._datagram(event.data)
             return
@@ -120,13 +127,23 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
             self._detach()
 
     def _stream_data(self, event: StreamDataReceived) -> None:
+        if event.stream_id % 4 != 0:
+            self._fail(PROTOCOL_ERROR, "client bidirectional stream required")
+            return
         if self.stream_id is None:
             self.stream_id = event.stream_id
-        if event.stream_id != self.stream_id or event.end_stream:
+        primary = event.stream_id == self.stream_id
+        if (not primary and self.session is None) or (primary and event.end_stream):
             self._fail(PROTOCOL_ERROR, "persistent stream required")
             return
+        if not primary and event.stream_id not in self._parsers:
+            if len(self._parsers) >= 32:
+                self._drop_stream(event.stream_id)
+                return
+            self._parsers[event.stream_id] = FrameParser()
+        parser = self.parser if primary else self._parsers[event.stream_id]
         try:
-            for frame in self.parser.feed(event.data):
+            for frame in parser.feed(event.data):
                 if self.session is None:
                     if self._attach_attempted:
                         raise FramingError("only one ATTACH attempt is allowed")
@@ -139,13 +156,50 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
                     message_id = metadata.get("messageId") if isinstance(metadata, dict) else None
                     if not isinstance(message_id, str) or not message_id:
                         raise FramingError("reliable message ID is invalid")
+                    if len(message_id) > 128 or message_id in self._replies or len(self._replies) >= 128:
+                        raise FramingError("reliable request limit exceeded")
+                    if sum(stream == event.stream_id for stream, _ in self._replies.values()) >= 16:
+                        raise FramingError("stream request limit exceeded")
+                    self._replies[message_id] = (event.stream_id, self._loop.call_later(
+                        30, self._drop_stream, event.stream_id,
+                    ))
                     self.service.handle_application_message(
                         self, self.session, "reliable", message_id, frame.payload
                     )
                 else:
                     raise FramingError("unexpected reliable frame")
+            if event.end_stream:
+                if parser._buffer:
+                    raise FramingError("incomplete final frame")
+                self._ended.add(event.stream_id)
+                self._finish_stream(event.stream_id)
         except Exception:
-            self._fail(PROTOCOL_ERROR, "invalid private transport frame")
+            if primary:
+                self._fail(PROTOCOL_ERROR, "invalid private transport frame")
+            else:
+                self._drop_stream(event.stream_id)
+
+    def _finish_stream(self, stream_id: int) -> None:
+        if stream_id not in self._ended or any(s == stream_id for s, _ in self._replies.values()):
+            return
+        self._ended.discard(stream_id)
+        self._parsers.pop(stream_id, None)
+        self._quic.send_stream_data(stream_id, b"", end_stream=True)
+        self.transmit()
+
+    def _drop_stream(self, stream_id: int) -> None:
+        if stream_id == self.stream_id:
+            self._fail(PROTOCOL_ERROR, "reliable request timed out")
+            return
+        self._parsers.pop(stream_id, None)
+        self._ended.discard(stream_id)
+        for message_id, (stream, timer) in tuple(self._replies.items()):
+            if stream == stream_id:
+                timer.cancel()
+                del self._replies[message_id]
+        self._quic.reset_stream(stream_id, PROTOCOL_ERROR)
+        self._quic.stop_stream(stream_id, PROTOCOL_ERROR)
+        self.transmit()
 
     def _attach(self, frame: Frame) -> None:
         if self._loop.time() >= self._auth_deadline:
@@ -174,6 +228,7 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
             return
         response = {
             "ok": True,
+            "reliableStreams": True,
             "logicalSessionId": self.session.session_id,
             "transportGeneration": 1,
             "reliable": True,
@@ -202,13 +257,19 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
         if lane == "datagram":
             self._quic.send_datagram_frame(encode_datagram(message_id, payload))
         elif lane == "reliable":
+            route = self._replies.pop(message_id, None)
+            if route is None:
+                return  # A cancelled/expired stream must never reply on another.
+            stream_id, timer = route
+            timer.cancel()
             self._send_frame(
                 Frame(
                     FRAME_RELIABLE,
                     encode_metadata({"messageId": message_id}),
                     payload,
-                )
+                ), stream_id
             )
+            self._finish_stream(stream_id)
             return
         else:
             raise ValueError("unsupported private transport lane")
@@ -232,10 +293,23 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
     def request_close(self, code: int, reason: str) -> None:
         self._loop.call_soon_threadsafe(self._fail, code, reason)
 
-    def _send_frame(self, frame: Frame) -> None:
+    def _send_frame(self, frame: Frame, stream_id: int | None = None) -> None:
         if self.stream_id is None:
             raise RuntimeError("private transport stream is unavailable")
-        self._quic.send_stream_data(self.stream_id, encode_frame(frame))
+        target = self.stream_id if stream_id is None else stream_id
+        encoded = encode_frame(frame)
+        # aioquic send_stream_data queues without a drain API. Bound unacknowledged
+        # bytes explicitly; cover this internal adapter when upgrading aioquic.
+        streams = self._quic._streams
+        queued = sum(len(stream.sender._buffer) for stream in streams.values())
+        if queued + len(encoded) > 2 * 1024 * 1024:
+            self._fail(PROTOCOL_ERROR, "connection send buffer limit exceeded")
+            return
+        stream = streams.get(target)
+        if stream is not None and len(stream.sender._buffer) + len(encoded) > 256 * 1024:
+            self._drop_stream(target)
+            return
+        self._quic.send_stream_data(target, encoded)
         self.transmit()
 
     def _fail(self, code: int, reason: str) -> None:
@@ -246,6 +320,10 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
         if self._detached:
             return
         self._detached = True
+        for _, timer in self._replies.values():
+            timer.cancel()
+        self._replies.clear()
+        self._parsers.clear()
         if self.session is not None:
             self.service.detach(self.session, self)
 

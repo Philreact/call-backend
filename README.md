@@ -253,6 +253,9 @@ backend and Go media service together so moderation is enforced on media too.
 Temporary encrypted file links are also supported. See
 [file-sharing setup, limits, and security](docs/file-sharing.md).
 
+For audio/screen transport scheduling and rollout, see
+[media delivery](docs/media-delivery.md).
+
 ```bash
 uv run pytest
 docker run --rm -v "$PWD/network:/src" -w /src golang:1.26-bookworm go test ./...

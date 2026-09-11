@@ -169,6 +169,7 @@ type subscription struct {
 	request *moqtransport.IncomingSubscribeRequest
 	owner   *connectionHandler
 	queue   chan *moqtransport.Object
+	policy  moqtransport.DeliveryPolicy
 	done    chan struct{}
 }
 
@@ -196,6 +197,11 @@ func allowedTrack(track string) bool {
 }
 
 func (b *broker) add(room, participant string, value *subscription, tracks ...string) {
+	track := mediaTrackName
+	if len(tracks) > 0 {
+		track = tracks[0]
+	}
+	value.policy = deliveryPolicy(track)
 	value.request.Accept(b.nextAlias.Add(1))
 	b.mu.Lock()
 	key := trackKey(room, participant, tracks...)
@@ -254,13 +260,19 @@ func (b *broker) publish(source grant, object *moqtransport.Object, tracks ...st
 				continue
 			}
 		}
-		copyObject := *object
-		copyObject.Payload = append([]byte(nil), object.Payload...)
 		select {
 		case <-value.done:
 			continue
 		default:
 		}
+		if object.ForwardingPreference == moqtransport.ObjectForwardingPreferenceDatagram {
+			// One bounded scheduler per recipient connection owns all datagram
+			// queues. Do not hide another FIFO in front of its deadlines/priorities.
+			_ = value.request.ScheduleDatagram(*object, value.policy)
+			continue
+		}
+		copyObject := *object
+		copyObject.Payload = append([]byte(nil), object.Payload...)
 		select {
 		case value.queue <- &copyObject:
 		default:
@@ -288,7 +300,7 @@ func (value *subscription) forward() {
 		}
 		var err error
 		if object.ForwardingPreference == moqtransport.ObjectForwardingPreferenceDatagram {
-			err = value.request.SendDatagram(*object)
+			err = value.request.ScheduleDatagram(*object, value.policy)
 		} else {
 			var subgroup *moqtransport.Subgroup
 			subgroup, err = value.request.OpenSubgroup(object.GroupID, object.SubGroupID, 0)
@@ -297,9 +309,21 @@ func (value *subscription) forward() {
 				_ = subgroup.Close()
 			}
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, moqtransport.ErrDeliveryQueueFull) {
 			log.Printf("media subscriber send failed: %v", err)
 		}
+	}
+}
+
+// Application policy belongs here, not in Hub, the relay, or the MoQ library.
+func deliveryPolicy(track string) moqtransport.DeliveryPolicy {
+	switch track {
+	case "audio":
+		return moqtransport.DeliveryPolicy{Priority: 0, MaxQueueAgeMillis: 120}
+	case "feedback":
+		return moqtransport.DeliveryPolicy{Priority: 0, MaxQueueAgeMillis: 500}
+	default:
+		return moqtransport.DeliveryPolicy{Priority: 1, MaxQueueAgeMillis: 200}
 	}
 }
 

@@ -65,6 +65,33 @@ and DATAGRAM ceiling, the Step 3 `QP3F` stream framing, and native `QP3D` QUIC
 DATAGRAM payloads. ATTACH must be the first application frame. No application
 message is dispatched before the token is accepted.
 
+### Independent reliable streams
+
+The ATTACHED response advertises `reliableStreams: true`. The original attach
+stream stays open for legacy clients. After authentication, clients may open
+up to 32 additional bidirectional streams. Each uses the same QP3F frames and
+has its own parser; replies return on the originating stream, including replies
+produced asynchronously. A new stream inherits the connection's authenticated
+session, never a client-supplied identity or stream name.
+
+A stream FIN drains its outstanding replies before the backend sends FIN.
+Reset, timeout or malformed framing on an additional stream resets that stream
+without disconnecting the others. Incomplete final frames are rejected. Late
+replies to expired/reset requests are dropped, not redirected to another stream.
+There are at most 16 pending requests per stream, 128 per connection, with a
+30-second reply deadline. Outgoing unacknowledged data is capped at 256 KiB per
+stream and 2 MiB per connection. The send-buffer adapter reads aioquic internals
+because its queue API has no drain method; test it when upgrading aioquic.
+
+The call app uses one stream per active upload/download, one for file-management
+requests, and one for reliable diagnostics. Bulk file operations and management
+operations have separate bounded worker pools. Audio/screen/feedback remain
+MoQ datagrams on the separate media connection; this does not change them.
+
+Roll out this backend before Hub sidecar 0.8.0 and the updated QApp. Old clients
+keep using the original stream. New clients report unsupported streams against
+an older backend. No relay update or new listening port is required.
+
 Development mode creates an ECDSA P-256 self-signed certificate and private key
 under the backend data directory when neither file exists. The private key is
 mode `0600`. Docker/production-shaped configurations refuse automatic creation

@@ -9,7 +9,7 @@ from aioquic.quic.configuration import QuicConfiguration
 
 from qapp_backend.private_transport import quic_server as module
 from qapp_backend.private_transport.framing import (
-    ALPN, FRAME_ATTACH, FRAME_RELIABLE, Frame, encode_frame, encode_metadata,
+    ALPN, FRAME_ATTACH, FRAME_RELIABLE, Frame, FrameParser, encode_frame, encode_metadata,
 )
 from qapp_backend.private_transport.service import ensure_transport_certificate
 
@@ -98,3 +98,89 @@ async def test_retry_under_load_and_capacity_recovery(endpoint, monkeypatch):
     monkeypatch.setattr(module, "UNAUTHENTICATED_CONNECTION_LIMIT", 256)
     async with connect("127.0.0.1", port, configuration=configuration) as client:
         await asyncio.wait_for(client.ping(), 1)
+
+
+async def test_independent_streams_route_replies_and_drain_fin(endpoint):
+    server, port, configuration, messages = endpoint
+    async with connect("127.0.0.1", port, configuration=configuration) as client:
+        attach_reader, attach = await client.create_stream()
+        attach.write(encode_frame(Frame(FRAME_ATTACH, encode_metadata({}))))
+        response = await asyncio.wait_for(attach_reader.read(1024), 1)
+        assert FrameParser().feed(response)[0].metadata_json()['reliableStreams']
+        protocol = next(p for p in server._protocols.values() if p.session is not None)
+        stalled_reader, stalled = await client.create_stream()
+        stalled.write(b'QP')  # An incomplete bulk frame must not block controls.
+        control_reader, control = await client.create_stream()
+        control.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': 'control'}), b'data')))
+        transfer_reader, transfer = await client.create_stream()
+        transfer.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': 'transfer'}), b'data')))
+        transfer.write_eof()
+        client.transmit()
+        for _ in range(100):
+            if len(messages) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert {m[3] for m in messages} == {'control', 'transfer'}
+        protocol.send_application('reliable', 'control', b'control response')
+        protocol.send_application('reliable', 'transfer', b'transfer response')
+        control_data = await asyncio.wait_for(control_reader.read(1024), 1)
+        transfer_data = await asyncio.wait_for(transfer_reader.read(), 1)
+        assert FrameParser().feed(control_data)[0].payload == b'control response'
+        assert FrameParser().feed(transfer_data)[0].payload == b'transfer response'
+        assert transfer.get_extra_info('stream_id') not in protocol._parsers
+        # Cancel just the stalled stream. The connection and control stream live.
+        client._quic.reset_stream(stalled.get_extra_info('stream_id'), 1)
+        client.transmit()
+        await asyncio.wait_for(client.ping(), 1)
+        control.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': 'again'}), b'ok')))
+        client.transmit()
+        for _ in range(100):
+            if 'again' in protocol._replies:
+                break
+            await asyncio.sleep(0.01)
+        protocol.send_application('reliable', 'again', b'still connected')
+        assert FrameParser().feed(await asyncio.wait_for(control_reader.read(1024), 1))[0].payload == b'still connected'
+
+
+async def test_additional_stream_cannot_bypass_attach(endpoint):
+    server, port, configuration, messages = endpoint
+    async with connect("127.0.0.1", port, configuration=configuration) as client:
+        _, first = await client.create_stream()
+        first.write(b'QP')
+        _, other = await client.create_stream()
+        other.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': 'unauthorized'}), b'data')))
+        client.transmit()
+        await asyncio.wait_for(client.wait_closed(), 1)
+        assert not messages
+
+
+async def test_blocked_reply_buffer_resets_only_bulk_stream(endpoint):
+    server, port, configuration, messages = endpoint
+    configuration.max_stream_data = 1024
+    async with connect("127.0.0.1", port, configuration=configuration) as client:
+        reader, attach = await client.create_stream()
+        attach.write(encode_frame(Frame(FRAME_ATTACH, encode_metadata({}))))
+        await asyncio.wait_for(reader.read(1024), 1)
+        protocol = next(p for p in server._protocols.values() if p.session is not None)
+        _, bulk = await client.create_stream()
+        for i in range(5):
+            bulk.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': f'bulk-{i}'}), b'data')))
+        client.transmit()
+        for _ in range(100):
+            if len(messages) == 5:
+                break
+            await asyncio.sleep(0.01)
+        assert len(messages) == 5
+        for i in range(5):
+            protocol.send_application('reliable', f'bulk-{i}', b'x' * (64 * 1024))
+        assert bulk.get_extra_info('stream_id') not in protocol._parsers
+        assert protocol.session is not None
+        control_reader, control = await client.create_stream()
+        control.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': 'control'}), b'data')))
+        client.transmit()
+        for _ in range(100):
+            if 'control' in protocol._replies:
+                break
+            await asyncio.sleep(0.01)
+        protocol.send_application('reliable', 'control', b'ok')
+        assert FrameParser().feed(await asyncio.wait_for(control_reader.read(1024), 1))[0].payload == b'ok'

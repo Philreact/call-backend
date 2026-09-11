@@ -38,7 +38,9 @@ func WithHandler(handler Handler) Option {
 
 // A Session is an endpoint of a MoQ Session session.
 type Session struct {
-	logger *slog.Logger
+	deliveryOnce sync.Once
+	delivery     *deliveryScheduler
+	logger       *slog.Logger
 
 	ctx       context.Context
 	cancelCtx context.CancelCauseFunc

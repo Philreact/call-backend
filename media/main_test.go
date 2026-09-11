@@ -383,6 +383,21 @@ func TestFanoutDoesNotBlockOtherRecipientsOrTracks(t *testing.T) {
 	}
 }
 
+func TestOutboundDeliveryPolicyIsApplicationOwned(t *testing.T) {
+	for _, track := range []string{"audio", "screen", "feedback"} {
+		p := deliveryPolicy(track)
+		if !p.Valid() {
+			t.Fatalf("invalid policy for %s", track)
+		}
+		if track == "screen" && p.Priority != 1 {
+			t.Fatal("screen shares urgent class")
+		}
+		if track != "screen" && p.Priority != 0 {
+			t.Fatal("latency-sensitive traffic not prioritized")
+		}
+	}
+}
+
 func TestRevocationStoreRejectsActiveMarkerAndExpiresIt(t *testing.T) {
 	directory := t.TempDir()
 	sessionID := "logical-session"

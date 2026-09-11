@@ -82,6 +82,38 @@ func (r *IncomingSubscribeRequest) Reject(code RequestErrorCode, reason string) 
 }
 
 func (r *IncomingSubscribeRequest) SendDatagram(o Object) error {
+	return r.sendDatagram(o, nil)
+}
+
+// ScheduleDatagram admits an unreliable object; success is not a delivery ACK.
+func (r *IncomingSubscribeRequest) ScheduleDatagram(o Object, policy DeliveryPolicy) error {
+	return r.sendDatagram(o, &policy)
+}
+
+// SendScheduledDatagram adds producer backpressure without blocking other tracks.
+// The result acknowledges QUIC admission, not reception by the peer.
+func (r *IncomingSubscribeRequest) SendScheduledDatagram(o Object, policy DeliveryPolicy) error {
+	result, err := r.ScheduleDatagramResult(o, policy)
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-r.session.ctx.Done():
+		return r.session.ctx.Err()
+	}
+}
+
+func (r *IncomingSubscribeRequest) ScheduleDatagramResult(o Object, policy DeliveryPolicy) (<-chan error, error) {
+	result := make(chan error, 1)
+	if err := r.sendDatagram(o, &policy, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (r *IncomingSubscribeRequest) sendDatagram(o Object, policy *DeliveryPolicy, result ...chan error) error {
 	// A datagram carries one complete object. Do not emulate unreliable
 	// delivery with a stream or retry a rejected send.
 	if err := r.session.ctx.Err(); err != nil {
@@ -98,6 +130,13 @@ func (r *IncomingSubscribeRequest) SendDatagram(o Object) error {
 		ObjectPayload:     o.Payload,
 	}
 	message.SetZeroObjectID(o.ObjectID == 0)
+	if policy != nil {
+		if !policy.Valid() {
+			return ErrDeliveryPolicy
+		}
+		message.PublisherPriority = uint8(policy.Priority * 64)
+		return r.session.scheduler().enqueue(r.trackAlias, message.AppendDatagram(nil), *policy, result...)
+	}
 	return r.session.conn.SendDatagram(message.AppendDatagram(nil))
 }
 

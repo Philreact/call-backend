@@ -351,7 +351,9 @@ class FileStore:
 def install_files(server: Any) -> None:
     store = FileStore(server.config.data_dir / 'files', server.config.core_url_bases)
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='file-transfer')
+    control_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='file-control')
     slots = threading.BoundedSemaphore(16)
+    control_slots = threading.BoundedSemaphore(8)
     stop = threading.Event()
     def cleanup_loop() -> None:
         while not stop.is_set():
@@ -367,12 +369,16 @@ def install_files(server: Any) -> None:
         stop.set()
         cleaner.join()
         executor.shutdown(wait=True)
+        control_executor.shutdown(wait=True)
         store.db.close()
     @server.on_message('file_request')
     def handle(ctx: Any, data: Any) -> None:
         if not hasattr(ctx, 'reply') or ctx.lane != 'reliable':
             raise ValueError('files require reliable private transport')
-        if not slots.acquire(blocking=False):
+        bulk = isinstance(data, dict) and data.get('op') in ('put', 'get')
+        request_slots = slots if bulk else control_slots
+        request_executor = executor if bulk else control_executor
+        if not request_slots.acquire(blocking=False):
             ctx.reply({'ok': False, 'error': 'BUSY'})
             return
         def work() -> None:
@@ -391,5 +397,5 @@ def install_files(server: Any) -> None:
                 logging.getLogger(__name__).exception('File operation failed')
                 ctx.reply({'ok': False, 'error': 'STORAGE_UNAVAILABLE'})
             finally:
-                slots.release()
-        executor.submit(work)
+                request_slots.release()
+        request_executor.submit(work)

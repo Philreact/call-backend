@@ -88,6 +88,11 @@ func (c *connection) SendDatagram(b []byte) error {
 	return c.connection.SendDatagram(b)
 }
 
+func (c *connection) DeliveryNetworkStats() moqtransport.DeliveryNetworkStats {
+	s := c.connection.ConnectionStats()
+	return moqtransport.DeliveryNetworkStats{RTT: s.SmoothedRTT, MinRTT: s.MinRTT, PacketsSent: s.PacketsSent, PacketsLost: s.PacketsLost}
+}
+
 func (c *connection) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	return c.connection.ReceiveDatagram(ctx)
 }
