@@ -26,7 +26,7 @@ WORKDIR /src
 COPY media/go.mod media/go.sum ./
 COPY media/third_party ./third_party
 RUN go mod download
-COPY media/main.go ./
+COPY media/*.go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/qapp-call-media .
 
 FROM debian:bookworm-slim AS media-runtime
