@@ -256,6 +256,17 @@ func TestTwoAuthenticatedClientsBlindForwardDatagram(t *testing.T) {
 	}
 	defer listener.Close()
 	media := newBroker()
+	policyDirectory := t.TempDir()
+	media.policies = &roomPolicyStore{directory: policyDirectory}
+	policy := roomPolicy{RoomID: "proof-room", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Members: map[string]string{"Alice123": "logical-session", "Bob123": "logical-session"}}
+	policyBytes, _ := json.Marshal(policy)
+	policyDigest := sha256.Sum256([]byte("proof-room"))
+	if err := os.Mkdir(filepath.Join(policyDirectory, "rooms"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(policyDirectory, "rooms", hex.EncodeToString(policyDigest[:])+".json"), policyBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
 	acceptErrors := make(chan error, 2)
 	go func() {
 		for range 2 {
@@ -335,7 +346,7 @@ func TestTwoAuthenticatedClientsBlindForwardDatagram(t *testing.T) {
 			case <-time.After(time.Millisecond):
 			}
 		}
-		media.publish(grant{RoomID: "proof-room", ParticipantID: "Alice123"}, &moqtransport.Object{
+		media.publish(grant{RoomID: "proof-room", ParticipantID: "Alice123", LogicalSessionID: "logical-session"}, &moqtransport.Object{
 			GroupID: 1, ObjectID: 1, ForwardingPreference: moqtransport.ObjectForwardingPreferenceDatagram,
 			Payload: []byte(track),
 		}, track)

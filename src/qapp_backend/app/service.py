@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from qapp_backend.call import CallService
+from qapp_backend.files import install_files
 
 
 
@@ -19,6 +20,7 @@ def _require_authenticated(session: Any) -> None:
 
 def install_reference_service(server: Any) -> None:
     CallService(server)
+    install_files(server)
 
     @server.rpc("/hello")
     def hello(ctx: Any, payload: Any) -> dict[str, Any]:

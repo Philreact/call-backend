@@ -42,7 +42,7 @@ BOOTSTRAP_PATH = "/qortal/private-transport/bootstrap/v1"
 BOOTSTRAP_VERSION = 1
 TRANSPORT = "quic-masque-inner-v1"
 PURPOSES = frozenset(("game", "file-transfer", "realtime"))
-DEVELOPMENT_MESSAGE_TYPES = frozenset(("private_transport_echo",))
+DEVELOPMENT_MESSAGE_TYPES = frozenset(("private_transport_echo", "file_request"))
 _NONCE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
 

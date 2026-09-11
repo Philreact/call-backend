@@ -173,6 +173,7 @@ type subscription struct {
 }
 
 type broker struct {
+	policies      *roomPolicyStore
 	mu            sync.RWMutex
 	subscriptions map[string]map[*subscription]struct{}
 	nextAlias     atomic.Uint64
@@ -227,6 +228,16 @@ func (b *broker) removeOwner(owner *connectionHandler) {
 }
 
 func (b *broker) publish(source grant, object *moqtransport.Object, tracks ...string) {
+	if b.policies != nil {
+		allowed, muted := b.policies.access(source, time.Now())
+		track := mediaTrackName
+		if len(tracks) > 0 {
+			track = tracks[0]
+		}
+		if !allowed || (muted && track == "audio") {
+			return
+		}
+	}
 	if len(object.Payload) == 0 || len(object.Payload) > maxObjectBytes {
 		return
 	}
@@ -237,6 +248,12 @@ func (b *broker) publish(source grant, object *moqtransport.Object, tracks ...st
 	}
 	b.mu.RUnlock()
 	for _, value := range values {
+		if b.policies != nil {
+			allowed, _ := b.policies.access(value.owner.principal, time.Now())
+			if !allowed {
+				continue
+			}
+		}
 		copyObject := *object
 		copyObject.Payload = append([]byte(nil), object.Payload...)
 		select {
@@ -368,6 +385,10 @@ func handleConnection(conn *quic.Conn, grants grantStore, revocations revocation
 		_ = conn.CloseWithError(2, "session revoked")
 		return
 	}
+	allowed, _ := media.policies.access(principal, time.Now())
+	if !allowed {
+		return
+	}
 	if !authenticated() {
 		return
 	}
@@ -399,7 +420,9 @@ func handleConnection(conn *quic.Conn, grants grantStore, revocations revocation
 			readers.Wait()
 			return
 		case <-revocationTicker.C:
-			if revocations.revoked(principal.LogicalSessionID, time.Now()) {
+			allowed, _ := media.policies.access(principal, time.Now())
+			if !allowed || revocations.revoked(principal.LogicalSessionID, time.Now()) {
+				handler.ready.Store(false)
 				_ = conn.CloseWithError(2, "session revoked")
 				readers.Wait()
 				return
@@ -469,6 +492,7 @@ func main() {
 	}
 	log.Printf("call media listener started on %s", *listen)
 	media := newBroker()
+	media.policies = &roomPolicyStore{directory: *revocations}
 	store := grantStore{directory: *grants}
 	revocationFiles := revocationStore{directory: *revocations}
 	store.purgeExpired(time.Now())

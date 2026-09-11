@@ -3,6 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
+import os
+import secrets
+from pathlib import Path
 import re
 import threading
 import time
@@ -95,6 +99,8 @@ class Room:
     screen_revision: int = 1
     screen_expires_at: float = 0
     screen_timer: threading.Timer | None = field(default=None, repr=False)
+    blocked: set[str] = field(default_factory=set)
+    muted: set[str] = field(default_factory=set)
 
 
 class CallService:
@@ -105,10 +111,21 @@ class CallService:
         self._rooms: dict[str, Room] = {}
         self._session_rooms: dict[str, str] = {}
         self._lock = threading.RLock()
+        # Rooms are in-memory. A restarted backend must not leave old media
+        # sessions authorized by policy files from its previous process.
+        config = getattr(server, "config", None)
+        directory = getattr(config, "call_media_revocations_path", None)
+        if directory is not None:
+            policies = Path(directory) / "rooms"
+            if policies.exists():
+                for path in policies.iterdir():
+                    if re.fullmatch(r"[a-f0-9]{64}\.json", path.name):
+                        path.unlink(missing_ok=True)
         server.on_message("call_create")(self.create)
         server.on_message("call_join")(self.join)
         server.on_message("call_leave")(self.leave)
         server.on_message("call_group_key")(self.forward_group_key)
+        server.on_message("call_moderate")(self.moderate)
         for kind in ("call_screen_start", "call_screen_stop", "call_screen_renew"):
             server.on_message(kind)(self.screen_control)
         server.on_session_disconnect(self.disconnected)
@@ -149,6 +166,13 @@ class CallService:
             room.expiry_timer = timer
             self._rooms[room_id] = room
             self._bind_session(ctx.session, room_id)
+            try:
+                self._write_policy(room)
+            except OSError:
+                self._rooms.pop(room_id, None)
+                self._session_rooms.pop(ctx.session.session_id, None)
+                self._clear_session_metadata(ctx.session)
+                raise
             snapshot = self._snapshot(room)
             timer.start()
 
@@ -188,6 +212,9 @@ class CallService:
                 hashlib.sha256(invite_token).digest(), room.invite_token_hash
             ):
                 raise ValueError("invalid call invitation")
+            if participant_id in room.blocked:
+                self._safe_send(ctx.session, {"type": "call_removed", "roomId": room_id})
+                return
             existing = room.members.get(participant_id)
             if existing is not None and existing.session is not ctx.session:
                 raise ValueError("participant is already active")
@@ -200,6 +227,7 @@ class CallService:
             self._bind_session(ctx.session, room_id)
             if changed:
                 room.revision += 1
+            self._write_policy(room)
             snapshot = self._snapshot(room)
             recipients = tuple(member.session for member in room.members.values())
 
@@ -306,6 +334,95 @@ class CallService:
                 "signature": message["signature"],
             },
         )
+
+    def moderate(self, ctx: Any, message: Any) -> None:
+        actor = _require_authenticated(ctx.session)
+        if not isinstance(message, dict) or set(message) != {
+            "type", "requestId", "roomId", "targetParticipantId", "operation"
+        }:
+            raise ValueError("invalid moderation request")
+        request_id = self._request_id(message)
+        room_id = self._room_id(message)
+        target = message.get("targetParticipantId")
+        operation = message.get("operation")
+        if not isinstance(target, str) or not _PARTICIPANT_ID.fullmatch(target) or operation not in {"mute", "allow_mic", "remove", "readmit"}:
+            raise ValueError("invalid moderation operation")
+        with self._lock:
+            room = self._rooms.get(room_id)
+            host = room.members.get(actor) if room else None
+            if room is None or actor != room.initiator_id or host is None or host.session is not ctx.session or room.expires_at_ms <= int(time.time() * 1000):
+                raise ValueError("only the active call creator can moderate")
+            if target == actor:
+                raise ValueError("cannot moderate the call creator")
+            if operation in {"mute", "allow_mic", "remove"} and target not in room.members and not (operation == "remove" and target in room.blocked):
+                self._safe_send(ctx.session, {"type": "call_moderation_result", "requestId": request_id,
+                    "roomId": room_id, "revision": room.revision, "accepted": False,
+                    "code": "PARTICIPANT_LEFT", "blockedParticipantIds": sorted(room.blocked)})
+                return
+            removed = None
+            if operation == "readmit":
+                room.blocked.discard(target)
+            elif operation == "remove":
+                if target not in room.members and target not in room.blocked:
+                    raise ValueError("participant is not in this call")
+                if len(room.blocked) >= 256 and target not in room.blocked:
+                    raise ValueError("removed participant limit reached")
+                room.blocked.add(target)
+                removed = room.members.get(target)
+                if removed:
+                    self._remove_member_locked(removed.session, room)
+                    self._clear_session_metadata(removed.session)
+                room.muted.discard(target)
+            else:
+                if target not in room.members:
+                    raise ValueError("participant is not in this call")
+                if operation == "mute":
+                    if len(room.muted) >= 256 and target not in room.muted:
+                        raise ValueError("muted participant limit reached")
+                    room.muted.add(target)
+                else:
+                    room.muted.discard(target)
+            room.revision += 1
+            self._write_policy(room)
+            snapshot = self._snapshot(room)
+            recipients = tuple(member.session for member in room.members.values())
+            # The removed-account list is sent only to the authenticated creator.
+            result = {"type": "call_moderation_result", "requestId": request_id,
+                      "roomId": room_id, "revision": room.revision,
+                      "accepted": True, "code": "",
+                      "blockedParticipantIds": sorted(room.blocked)}
+        if removed:
+            self._safe_send(removed.session, {"type": "call_removed", "roomId": room_id})
+        self._broadcast(recipients, {"type": "call_membership", **snapshot})
+        self._safe_send(ctx.session, result)
+
+    def _policy_path(self, room_id: str) -> Path | None:
+        config = getattr(self.server, "config", None)
+        directory = getattr(config, "call_media_revocations_path", None)
+        if directory is None:
+            return None  # In-memory test servers have no media sidecar.
+        return Path(directory) / "rooms" / (hashlib.sha256(room_id.encode()).hexdigest() + ".json")
+
+    def _write_policy(self, room: Room) -> None:
+        path = self._policy_path(room.room_id)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+                json.dump({"roomId": room.room_id, "expiresAt": room.expires_at_ms,
+                           "members": {key: value.session.session_id for key, value in room.members.items()},
+                           "muted": sorted(room.muted.intersection(room.members))}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError:
+            # Never leave an older, more permissive policy after a failed update.
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def disconnected(self, session: Any) -> None:
         with self._lock:
@@ -449,6 +566,7 @@ class CallService:
             "initiatorParticipantId": room.initiator_id,
             "expiresAt": room.expires_at_ms,
             "screenShare": CallService._screen_snapshot(room),
+            "mutedParticipantIds": sorted(room.muted.intersection(room.members)),
             "members": [
                 room.members[participant_id].public_value(room.room_id)
                 for participant_id in sorted(room.members)
@@ -476,6 +594,7 @@ class CallService:
             self._clear_screen_locked(room)
         self._session_rooms.pop(session.session_id, None)
         room.revision += 1
+        self._write_policy(room)
         return (
             tuple(value.session for value in room.members.values()),
             self._snapshot(room),
@@ -484,6 +603,9 @@ class CallService:
     def _end_room_locked(self, room: Room) -> tuple[Any, ...]:
         self._clear_screen_locked(room)
         self._rooms.pop(room.room_id, None)
+        policy_path = self._policy_path(room.room_id)
+        if policy_path is not None:
+            policy_path.unlink(missing_ok=True)
         if room.expiry_timer is not None:
             room.expiry_timer.cancel()
         recipients: list[Any] = []
