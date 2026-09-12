@@ -54,7 +54,10 @@ external backups.
   10 GiB globally. The expiry maximum applies to newly created links.
 - Maximum 100 records per uploader and 1,000 active records globally.
 - Four file workers with at most 16 queued/running file operations.
-- Four chunks in flight per client, below Hub's message/queue limits.
+- Uploads start with four chunks in flight and grow to at most twelve on
+  successful acknowledgements. BUSY responses reduce the window and trigger
+  bounded backoff with identical ciphertext; other errors stop the upload.
+  Downloads retain four chunks in flight.
 - Owner lists are paged in groups of five; no unbounded list response.
 - Upload-resume status is paginated at 4,096 chunk indices per response, keeping
   responses below the private channel's 64 KiB message limit even for 3 GiB files.

@@ -35,3 +35,26 @@ def test_stream_parser_rejects_unsupported_version():
     encoded[4] = 2
     with pytest.raises(FramingError):
         FrameParser().feed(encoded)
+
+
+@pytest.mark.parametrize('split', [0, 7, 12000, 65550])
+def test_large_coalesced_delivery_preserves_frames_and_partial_tail(split):
+    frames = tuple(Frame(FRAME_RELIABLE, encode_metadata({'messageId': str(i)}),
+                         bytes([i]) * 65536) for i in range(8))
+    wire = b''.join(encode_frame(frame) for frame in frames)
+    parser = FrameParser()
+    first = parser.feed(wire[:split])
+    middle = parser.feed(wire[split:-31])
+    assert len(parser._buffer) < 65536 + 4096 + 12
+    last = parser.feed(wire[-31:])
+    assert first + middle + last == frames
+    assert not parser._buffer
+
+
+def test_oversized_frame_header_is_rejected_before_buffering_body():
+    import struct
+    header = struct.pack('>4sBBHI', b'QP3F', 1, FRAME_RELIABLE, 0, 65537)
+    parser = FrameParser()
+    with pytest.raises(FramingError, match='inner frame exceeds limit'):
+        parser.feed(header + b'x' * 200000)
+    assert len(parser._buffer) == len(header)

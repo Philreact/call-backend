@@ -70,13 +70,18 @@ class FrameParser:
         self._buffer = bytearray()
 
     def feed(self, data: bytes) -> tuple[Frame, ...]:
-        self._buffer.extend(data)
-        if len(self._buffer) > 2 * (
-            _HEADER.size + MAX_METADATA_BYTES + MAX_RELIABLE_PAYLOAD_BYTES
-        ):
-            raise FramingError("inner frame buffer exceeds limit")
+        # QUIC delivery boundaries are unrelated to application frames. Retain
+        # at most one incomplete frame, even when many arrive in one event.
+        incoming = memoryview(data)
+        offset = 0
         frames: list[Frame] = []
-        while len(self._buffer) >= _HEADER.size:
+        while offset < len(incoming):
+            take = min(_HEADER.size - len(self._buffer), len(incoming) - offset)
+            if take > 0:
+                self._buffer.extend(incoming[offset:offset + take])
+                offset += take
+            if len(self._buffer) < _HEADER.size:
+                break
             magic, version, frame_type, metadata_length, payload_length = (
                 _HEADER.unpack_from(self._buffer)
             )
@@ -88,6 +93,9 @@ class FrameParser:
             ):
                 raise FramingError("inner frame exceeds limit")
             total = _HEADER.size + metadata_length + payload_length
+            take = min(total - len(self._buffer), len(incoming) - offset)
+            self._buffer.extend(incoming[offset:offset + take])
+            offset += take
             if len(self._buffer) < total:
                 break
             metadata_start = _HEADER.size

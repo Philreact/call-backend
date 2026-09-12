@@ -173,7 +173,10 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
                     raise FramingError("incomplete final frame")
                 self._ended.add(event.stream_id)
                 self._finish_stream(event.stream_id)
-        except Exception:
+        except Exception as exc:
+            # Record the failure category without logging payloads or secrets.
+            logger.warning("private stream rejected: stream=%s category=%s",
+                           event.stream_id, type(exc).__name__)
             if primary:
                 self._fail(PROTOCOL_ERROR, "invalid private transport frame")
             else:
