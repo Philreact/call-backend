@@ -27,7 +27,9 @@ COPY media/go.mod media/go.sum ./
 COPY media/third_party ./third_party
 RUN go mod download
 COPY media/*.go ./
+COPY media/cmd ./cmd
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/qapp-call-media .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/qapp-private-transport ./cmd/private-transport
 
 FROM debian:bookworm-slim AS media-runtime
 
@@ -68,6 +70,7 @@ RUN groupadd --system --gid 10001 qapp \
 
 WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
+COPY --from=media-build /out/qapp-private-transport /usr/local/bin/qapp-private-transport
 
 USER qapp
 VOLUME ["/data/reticulum", "/data/backend", "/data/backups"]

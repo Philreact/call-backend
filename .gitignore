@@ -12,3 +12,4 @@ config.dev.toml
 /.env
 /0/
 /.qapp-backend-call-instance.lock
+/media/bin/

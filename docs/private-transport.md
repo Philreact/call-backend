@@ -60,8 +60,8 @@ session, and 1024 outstanding globally.
 
 ## QUIC listener
 
-The backend uses `aioquic` with ALPN `qortal-private/1`, a 1200-byte QUIC packet
-and DATAGRAM ceiling, the Step 3 `QP3F` stream framing, and native `QP3D` QUIC
+The backend starts a supervised Go/quic-go child with ALPN `qortal-private/1`,
+a 1200-byte inner QUIC packet ceiling, `QP3F` stream framing, and native `QP3D` QUIC
 DATAGRAM payloads. ATTACH must be the first application frame. No application
 message is dispatched before the token is accepted.
 
@@ -78,10 +78,12 @@ A stream FIN drains its outstanding replies before the backend sends FIN.
 Reset, timeout or malformed framing on an additional stream resets that stream
 without disconnecting the others. Incomplete final frames are rejected. Late
 replies to expired/reset requests are dropped, not redirected to another stream.
-There are at most 16 pending requests per stream, 128 per connection, with a
-30-second reply deadline. Outgoing unacknowledged data is capped at 256 KiB per
-stream and 2 MiB per connection. The send-buffer adapter reads aioquic internals
-because its queue API has no drain method; test it when upgrading aioquic.
+There are at most eight frames being processed per connection and 32 globally,
+with bounded payloads and 30-second body/write/control deadlines. quic-go stream
+writes apply backpressure instead of placing unbounded data into a Python send
+queue. File ciphertext is read/written directly by Go; only authorization,
+metadata and small application messages use the private parent/child IPC.
+See [native data plane](native-data-plane.md) for the resource and durability model.
 
 The call app uses one stream per active upload/download, one for file-management
 requests, and one for reliable diagnostics. Bulk file operations and management

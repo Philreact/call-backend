@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import logging
 import math
@@ -79,9 +80,11 @@ class FileStore:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (directory / 'locks').mkdir(exist_ok=True, mode=0o700)
         self.lock = threading.RLock()
         self.file_locks: dict[str, list[Any]] = {}
         self.pending_writes: dict[str, list[Any]] = {}
+        self.native_writes: dict[str, Any] = {}
         self.write_slots = threading.BoundedSemaphore(MAX_PENDING_WRITES)
         self.db = sqlite3.connect(directory / "files.sqlite3", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -123,7 +126,16 @@ class FileStore:
             entry[1] += 1
         try:
             with entry[0]:
-                yield
+                # Fixed-size, cross-process lock set shared with the native data
+                # plane. Never unlink lock files: waiters must retain one inode.
+                if not isinstance(file_id, str) or not ID.fullmatch(file_id):
+                    raise FileError('NOT_AVAILABLE')
+                with (self.directory / 'locks' / file_id[:2]).open('a+b') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
         finally:
             with self.lock:
                 entry[1] -= 1
@@ -139,6 +151,7 @@ class FileStore:
             with self.file_lock(file_id):
                 (self.directory / f'{file_id}.bin').unlink(missing_ok=True)
                 with self.lock, self.db:
+                    self.native_writes.pop(file_id, None)
                     self.db.execute("UPDATE files SET state='expired' WHERE id=? AND state!='deleted'", (file_id,))
                     self.db.execute('DELETE FROM chunks WHERE file_id=?', (file_id,))
                     self.db.execute("DELETE FROM files WHERE id=? AND (state='deleted' OR expires<?)", (file_id, now - 7*86400))
@@ -322,6 +335,7 @@ class FileStore:
                 if totals[0] >= 1000 or own[0] >= 100 or totals[1]+size > GLOBAL_QUOTA or own[1]+size > OWNER_QUOTA:
                     raise FileError('STORAGE_FULL')
                 now = int(time.time())
+                self.native_writes.pop(file_id, None)
                 with (self.directory / f'{file_id}.bin').open('xb'):
                     pass
                 # Persist the directory entry before publishing its DB record.
@@ -346,6 +360,7 @@ class FileStore:
         with self.lock, self.db:
             row = self.row(file_id)
             if op == 'delete':
+                self.native_writes.pop(file_id, None)
                 self.db.execute("UPDATE files SET state='deleted' WHERE id=?", (file_id,))
                 (self.directory / f'{file_id}.bin').unlink(missing_ok=True)
                 self.db.execute('DELETE FROM chunks WHERE file_id=?', (file_id,))
@@ -389,6 +404,7 @@ class FileStore:
 
 def install_files(server: Any) -> None:
     store = FileStore(server.config.data_dir / 'files')
+    server.file_store = store
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='file-transfer')
     control_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='file-control')
     slots = threading.BoundedSemaphore(16)

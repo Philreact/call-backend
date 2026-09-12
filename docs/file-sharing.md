@@ -53,7 +53,9 @@ external backups.
 - Maximum 3 GiB per file (shown as 3 GB in the UI), 3 GiB reserved per uploader,
   10 GiB globally. The expiry maximum applies to newly created links.
 - Maximum 100 records per uploader and 1,000 active records globally.
-- Four file workers with at most 16 queued/running file operations.
+- Native QUIC and disk I/O with eight in-flight frames per connection and 32
+  globally; Python receives only bounded control and chunk metadata. See
+  [native data plane](native-data-plane.md) for full budgets.
 - Updated Hub/QApp clients use binary batches of up to 16 encrypted chunks
   (about 512 KiB), starting with four batches and growing to eight in flight.
   Legacy clients start with four individual chunks and grow to twelve on
@@ -76,13 +78,12 @@ for seven further days for the owner's expired view. Explicit deletion invalidat
 the link and removes ciphertext; metadata is purged on the next sweep.
 
 Chunks are immutable and acknowledged only after their bytes are synced to disk
-and the SQLite index transaction is committed with full durability. Concurrent
-upload requests for one file are collected for up to 5 ms and share one file
-sync and index transaction. Batching is bounded to 16 pending chunks across the
-store. Binary batches instead validate all records before writing and share one
-sync/index transaction per batch. Replaying identical ciphertext is idempotent;
-conflicting ciphertext is rejected. Per-file locks coordinate writes, reads, deletion and cleanup; disk reads
-and upload syncs do not hold the shared metadata lock.
+and the SQLite index transaction is committed with full durability. Binary
+batches validate all records before writing and share one sync/index transaction
+per batch. Replaying identical ciphertext is idempotent; conflicting ciphertext
+is rejected. Cross-process file locks coordinate writes, reads, deletion and
+cleanup; native disk reads and upload syncs do not hold Python's shared metadata
+lock. Legacy single-chunk requests also use the native disk path.
 
 An interrupted uploader selects the original file; its fingerprint is checked
 before only missing chunks are sent. Download retries cache only ciphertext in

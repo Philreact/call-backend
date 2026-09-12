@@ -8,3 +8,4 @@ secrets
 config.toml
 0
 *.pyc
+media/bin

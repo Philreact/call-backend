@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import time
+import cProfile
+import pstats
+import threading
 import sys
 import tempfile
 from dataclasses import replace
@@ -83,6 +89,24 @@ def authenticate_session(
 
 
 def main() -> int:
+    # Historical comparison only. Production always starts the native listener.
+    if os.environ.get("QORTAL_STEP4_BULK_BENCH") == "1":
+        import qapp_backend.private_transport.service as service_module
+        from qapp_backend.private_transport.quic_server import PrivateQuicServer
+        service_module.PrivateQuicServer = PrivateQuicServer
+    if os.environ.get("QORTAL_STEP4_UVLOOP") == "1":
+        import asyncio
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    if os.environ.get("QORTAL_STEP4_COALESCE") == "1":
+        from qapp_backend.private_transport.quic_server import PrivateQuicProtocol
+        def receive_coalesced(self, data, addr):
+            if self.peer_address is None:
+                self.peer_address = addr
+            self._quic.receive_datagram(data, addr, now=self._loop.time())
+            self._process_events()
+            self._transmit_soon()
+        PrivateQuicProtocol.datagram_received = receive_coalesced
     temporary = tempfile.TemporaryDirectory(prefix="qapp-step4-")
     root = Path(temporary.name)
     config = replace(
@@ -93,6 +117,9 @@ def main() -> int:
         database_path=root / "backend" / "database.sqlite3",
         private_transport_cert_path=root / "backend" / "private-cert.pem",
         private_transport_key_path=root / "backend" / "private-key.pem",
+        network_state_path=root / "network" / "reachability.json",
+        call_media_grants_path=root / "backend" / "call-media-grants",
+        call_media_revocations_path=root / "backend" / "call-media-revocations",
         allowed_qapps=(("qapp-ui-call", "APP"),),
     )
     config.ensure_directories()
@@ -103,6 +130,20 @@ def main() -> int:
     server.database.open()
     server.destination_hash = "0123456789abcdef0123456789abcdef"
     server.private_transport.start()
+    # Opt-in transport benchmark: real auth, framing and aioquic; a tiny reply
+    # excludes file storage so it cannot be mistaken for an end-to-end file test.
+    bench = os.environ.get("QORTAL_STEP4_BULK_BENCH") == "1"
+    if bench:
+        server.message_handlers["file_binary"] = lambda ctx, data: ctx.reply({"receivedBytes": len(data)})
+        udp = server.private_transport.quic_server._server._transport.get_extra_info("socket")
+        requested = int(os.environ.get("QORTAL_STEP4_RECEIVE_BYTES", "0"))
+        if requested:
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested)
+        cpu_start = time.process_time()
+        profiler = None
+        if os.environ.get("QORTAL_STEP4_PROFILE") == "1":
+            profiler = cProfile.Profile()
+            server.private_transport.quic_server._loop.call_soon_threadsafe(profiler.enable)
     connection = PhysicalConnection(
         lambda _data: None,
         config,
@@ -165,8 +206,24 @@ def main() -> int:
                 )
             elif operation == "stats":
                 peer = server.private_transport.latest_peer_address
+                diagnostic = {}
+                if bench:
+                    port = udp.getsockname()[1]
+                    rows = Path("/proc/net/udp").read_text().splitlines()[1:] if Path("/proc/net/udp").exists() else []
+                    drops = next((int(row.split()[-1]) for row in rows if row.split()[1].endswith(f":{port:04X}")), None)
+                    diagnostic = {"receiveBytes": udp.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF), "kernelDrops": drops, "cpuSeconds": time.process_time() - cpu_start}
+                    if profiler is not None:
+                        stopped = threading.Event()
+                        def stop_profile():
+                            profiler.disable()
+                            stopped.set()
+                        server.private_transport.quic_server._loop.call_soon_threadsafe(stop_profile)
+                        stopped.wait(5)
+                        profile = pstats.Stats(profiler)
+                        diagnostic["profile"] = [{"function":f"{Path(k[0]).name}:{k[1]}:{k[2]}","calls":v[1],"selfSeconds":round(v[2],3),"cumulativeSeconds":round(v[3],3)} for k,v in sorted(profile.stats.items(),key=lambda row:row[1][2],reverse=True)[:18]]
                 write(
                     {
+                        "diagnostic": diagnostic,
                         "logicalSessionId": session.session_id if session else None,
                         "privateAttached": bool(
                             session is not None
@@ -197,6 +254,8 @@ def main() -> int:
                 write({"error": {"code": "unknown_operation"}})
     finally:
         server.private_transport.stop()
+        for handler in server.shutdown_handlers:
+            handler()
         server.database.close()
         temporary.cleanup()
     return 0

@@ -24,7 +24,7 @@ from qapp_backend.private_transport.authorization import (
     BootstrapRateLimited,
 )
 from qapp_backend.private_transport.framing import PROTOCOL_VERSION
-from qapp_backend.private_transport.quic_server import PrivateQuicServer
+from qapp_backend.private_transport.native_server import NativeQuicServer as PrivateQuicServer
 from qapp_backend.private_transport.reachability import (
     ReachabilityUnavailable,
     resolve_public_host,

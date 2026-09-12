@@ -183,10 +183,16 @@ transport bootstrap. It does not publish a separate backend directory.
 ```bash
 cp config.example.toml config.toml
 uv sync
+sh scripts/build-private-transport.sh
 uv run qapp-backend-call --config config.toml --check-config
 uv run qapp-backend-call --config config.toml --print-destination
 uv run qapp-backend-call --config config.toml
 ```
+
+Source development requires Go 1.26 or newer for that build step. Docker builds
+and bundles the native transport automatically; Docker hosts do not need Go.
+The backend starts and supervises it automatically, using the same UDP 4445
+endpoint and certificate. Rebuild it after changing `media/cmd/private-transport`.
 
 Set the printed destination as `VITE_CALL_BACKEND_DESTINATION` in the companion
 `qapp-ui-call` project.
@@ -239,10 +245,11 @@ rejection logs are suppressed to avoid log amplification.
 
 These are application resource protections, not a guarantee against DDoS or
 bandwidth saturation. Use the hosting provider's upstream UDP DDoS protection.
-These limits currently live in `media/admission.go` and
-`src/qapp_backend/private_transport/quic_server.py`. The latter uses aioquic's
-internal CID routing map; run its wire-level admission tests when upgrading
-aioquic.
+These limits live in `media/admission.go` and
+`media/cmd/private-transport/admission.go`. The private data plane also caps total
+connections at 256 and bounds concurrent frame processing. See
+[native data plane](docs/native-data-plane.md) for resource budgets and failure
+handling. Python no longer processes UDP/QUIC packets in production.
 
 ## Verification
 
