@@ -289,7 +289,8 @@ class FileStore:
 
     def request(self, user: str, data: dict[str, Any]) -> Any:
         if data.get('op') == 'capabilities':
-            return {'binaryUploadVersion': 1, 'batchChunks': BATCH_CHUNKS, 'maxInFlightBatches': 8}
+            return {'binaryUploadVersion': 1, 'binaryDownloadVersion': 1,
+                    'batchChunks': BATCH_CHUNKS, 'maxInFlightBatches': 8}
         if data.get('op') == 'list':
             return self._request(user, data)
         file_id = data.get('id')

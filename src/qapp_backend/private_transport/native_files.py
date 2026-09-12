@@ -19,11 +19,22 @@ def native_file_request(store, user, request):
         if row['expires'] <= time.time() or row['state'] == 'expired':
             raise FileError('EXPIRED')
         count = max(1, math.ceil(row['size'] / CHUNK_SIZE))
-        if op == 'read':
+        if op in ('read', 'read_batch'):
             if row['state'] != 'ready':
                 raise FileError('UPLOAD_INCOMPLETE')
-            index = integer(request.get('index'), 0, count - 1)
-            return {'length': min(CHUNK_SIZE, max(0, row['size'] - index * CHUNK_SIZE)) + 28}
+            indices = ([request.get('index')] if op == 'read'
+                       else request.get('indices'))
+            if (not isinstance(indices, list) or
+                    not 1 <= len(indices) <= BATCH_CHUNKS):
+                raise FileError('INVALID_REQUEST')
+            checked = [integer(index, 0, count - 1) for index in indices]
+            if len(set(checked)) != len(checked):
+                raise FileError('INVALID_REQUEST')
+            lengths = [min(CHUNK_SIZE, max(0, row['size'] - index * CHUNK_SIZE)) + 28
+                       for index in checked]
+            if op == 'read':
+                return {'length': lengths[0]}
+            return {'indices': checked, 'lengths': lengths}
         if op not in ('prepare', 'commit'):
             raise FileError('INVALID_REQUEST')
         if row['owner'] != user:

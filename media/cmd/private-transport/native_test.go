@@ -215,3 +215,54 @@ func TestDownloadsShareLocksButBlockDeletion(t *testing.T) {
 	}
 	writer.Close()
 }
+
+func TestBatchDownloadReadsOrderedCiphertext(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Mkdir(filepath.Join(directory, "locks"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	id := "abababababababababababababababab"
+	first := bytes.Repeat([]byte{1}, chunkSize+28)
+	second := bytes.Repeat([]byte{2}, chunkSize+28)
+	if err := os.WriteFile(filepath.Join(directory, id+".bin"), append(first, second...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	c := newControl(left)
+	defer left.Close()
+	defer right.Close()
+	go func() {
+		scanner := bufio.NewScanner(right)
+		if scanner.Scan() {
+			var message controlMessage
+			_ = json.Unmarshal(scanner.Bytes(), &message)
+			response := controlMessage{ID: message.ID, OK: true,
+				Result: json.RawMessage(`{"indices":[1,0],"lengths":[32796,32796]}`)}
+			encoded, _ := json.Marshal(response)
+			_, _ = right.Write(append(encoded, '\n'))
+		}
+	}()
+	result, err := fileDownloadBatch(context.Background(), c, "test", directory,
+		fileRequest{ID: id, Indices: []int{1, 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(result[:4]) != "QFD1" || binary.BigEndian.Uint16(result[4:6]) != 2 {
+		t.Fatal("invalid batch header")
+	}
+	offset := 6
+	for position, expected := range [][]byte{second, first} {
+		if int(binary.BigEndian.Uint32(result[offset:offset+4])) != 1-position ||
+			int(binary.BigEndian.Uint32(result[offset+4:offset+8])) != len(expected) {
+			t.Fatal("invalid chunk descriptor")
+		}
+		offset += 8
+		if !bytes.Equal(result[offset:offset+len(expected)], expected) {
+			t.Fatal("wrong ciphertext")
+		}
+		offset += len(expected)
+	}
+	if offset != len(result) {
+		t.Fatal("trailing batch data")
+	}
+}

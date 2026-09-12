@@ -29,13 +29,14 @@ type chunk struct {
 	data   []byte
 }
 type fileRequest struct {
-	Type   string  `json:"type"`
-	Op     string  `json:"op"`
-	ID     string  `json:"id"`
-	Index  int     `json:"index"`
-	Chunk  string  `json:"chunk"`
-	Chunks []chunk `json:"chunks,omitempty"`
-	Lease  string  `json:"lease,omitempty"`
+	Type    string  `json:"type"`
+	Op      string  `json:"op"`
+	ID      string  `json:"id"`
+	Index   int     `json:"index"`
+	Chunk   string  `json:"chunk"`
+	Chunks  []chunk `json:"chunks,omitempty"`
+	Indices []int   `json:"indices,omitempty"`
+	Lease   string  `json:"lease,omitempty"`
 }
 
 func parseBatch(data []byte) (fileRequest, error) {
@@ -197,6 +198,66 @@ func fileOperation(ctx context.Context, c *control, connection, directory string
 	r.Op = "commit"
 	r.Lease = plan.Lease
 	return query(r)
+}
+
+// fileDownloadBatch keeps ciphertext out of the Python control plane and
+// amortizes request/stream overhead across a bounded 512 KiB response.
+func fileDownloadBatch(ctx context.Context, c *control, connection, directory string, r fileRequest) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if len(r.Indices) < 1 || len(r.Indices) > 16 {
+		return nil, errors.New("INVALID_REQUEST")
+	}
+	lock, err := lockFile(ctx, directory, r.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	r.Op = "read_batch"
+	result, err := c.call(ctx, controlMessage{Op: "file", Connection: connection, Metadata: r})
+	if err != nil {
+		return nil, err
+	}
+	var plan struct {
+		Indices []int `json:"indices"`
+		Lengths []int `json:"lengths"`
+	}
+	if json.Unmarshal(result, &plan) != nil || len(plan.Indices) != len(r.Indices) || len(plan.Lengths) != len(r.Indices) {
+		return nil, errors.New("FILE_DAMAGED")
+	}
+	total := 6
+	for i, index := range plan.Indices {
+		if index != r.Indices[i] || plan.Lengths[i] < 28 || plan.Lengths[i] > chunkSize+28 {
+			return nil, errors.New("FILE_DAMAGED")
+		}
+		total += 8 + plan.Lengths[i]
+	}
+	if total > maxPayload-1 {
+		return nil, errors.New("INVALID_REQUEST")
+	}
+	f, err := openBlob(directory, r.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data := make([]byte, total)
+	copy(data, "QFD1")
+	binary.BigEndian.PutUint16(data[4:6], uint16(len(plan.Indices)))
+	offset := 6
+	for i, index := range plan.Indices {
+		length := plan.Lengths[i]
+		binary.BigEndian.PutUint32(data[offset:offset+4], uint32(index))
+		binary.BigEndian.PutUint32(data[offset+4:offset+8], uint32(length))
+		offset += 8
+		if _, err = f.ReadAt(data[offset:offset+length], int64(index)*(chunkSize+28)); err != nil {
+			return nil, errors.New("FILE_DAMAGED")
+		}
+		offset += length
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return data, nil
 }
 func publicError(err error) string {
 	// Never expose OS paths or internal errors to a peer.

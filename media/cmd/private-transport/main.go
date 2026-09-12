@@ -100,6 +100,16 @@ func (s *server) application(ctx context.Context, connection, lane, messageID st
 	if json.Unmarshal(payload[1:], &r) != nil {
 		return applicationResult(nil, errors.New("INVALID_REQUEST"))
 	}
+	if r.Type == "file_request" && r.Op == "get_batch" {
+		if lane != "reliable" {
+			return applicationResult(nil, errors.New("INVALID_REQUEST"))
+		}
+		result, err := fileDownloadBatch(ctx, s.control, connection, s.files, r)
+		if err != nil {
+			return applicationResult(nil, err)
+		}
+		return append([]byte{1}, result...)
+	}
 	if r.Type == "file_request" && (r.Op == "get" || r.Op == "put") {
 		if lane != "reliable" {
 			return applicationResult(nil, errors.New("INVALID_REQUEST"))

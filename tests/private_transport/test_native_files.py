@@ -47,6 +47,23 @@ def test_native_policy_and_immutable_chunk_checks(store):
         native_file_request(store, 'owner', request)
 
 
+def test_native_batch_read_plan_is_bounded_and_ordered(store):
+    with store.db:
+        store.db.execute("UPDATE files SET state='ready' WHERE id=?", (FILE_ID,))
+    result = native_file_request(store, 'reader', {
+        'op': 'read_batch', 'id': FILE_ID, 'indices': [1, 0]})
+    assert result == {
+        'indices': [1, 0],
+        'lengths': [CHUNK_SIZE + 28, CHUNK_SIZE + 28],
+    }
+    with pytest.raises(FileError, match='INVALID_REQUEST'):
+        native_file_request(store, 'reader', {
+            'op': 'read_batch', 'id': FILE_ID, 'indices': [0, 0]})
+    with pytest.raises(FileError, match='INVALID_REQUEST'):
+        native_file_request(store, 'reader', {
+            'op': 'read_batch', 'id': FILE_ID, 'indices': list(range(17))})
+
+
 def test_late_commit_cannot_index_a_newer_retry(store):
     first = {'op': 'prepare', 'id': FILE_ID, 'chunks': [descriptor()]}
     old = native_file_request(store, 'owner', first)
