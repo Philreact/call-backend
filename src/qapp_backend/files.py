@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import logging
 import math
 import os
@@ -16,7 +15,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from qapp_backend.auth.group_access import GroupAccessPolicy, GroupAccessDenied, GroupAccessUnavailable
+from qapp_backend.auth.group_access import GroupAccessDenied, GroupAccessUnavailable
+
 
 CHUNK_SIZE = 32768
 MAX_FILE_SIZE = 3 * 1024 * 1024 * 1024
@@ -27,7 +27,6 @@ CLEANUP_INTERVAL = 300
 WRITE_BATCH_DELAY = 0.005
 MAX_PENDING_WRITES = 16
 ID = re.compile(r"^[a-f0-9]{32}$")
-ADDRESS = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{25,40}$")
 
 
 class FileError(ValueError):
@@ -52,23 +51,8 @@ def encoded(value: Any, maximum: int) -> bytes:
     return raw
 
 
-def access(value: Any) -> tuple[list[int], list[str]]:
-    if not isinstance(value, dict):
-        raise FileError("INVALID_ACCESS")
-    groups, users = value.get("groups", []), value.get("users", [])
-    if not isinstance(groups, list) or not isinstance(users, list) or len(groups) > 16 or len(users) > 32:
-        raise FileError("INVALID_ACCESS")
-    for group in groups:
-        integer(group, 1, 2**31-1)
-    if any(not isinstance(user, str) or not ADDRESS.fullmatch(user) for user in users):
-        raise FileError("INVALID_ACCESS")
-    if not groups and not users:
-        raise FileError("CHOOSE_RECIPIENTS")
-    return sorted(set(groups)), sorted(set(users))
-
-
 class FileStore:
-    def __init__(self, directory: Path, core_urls: tuple[str, ...]) -> None:
+    def __init__(self, directory: Path) -> None:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = threading.RLock()
@@ -83,14 +67,29 @@ class FileStore:
             CREATE TABLE IF NOT EXISTS files (
               id TEXT PRIMARY KEY, owner TEXT NOT NULL, size INTEGER NOT NULL,
               expires INTEGER NOT NULL, created INTEGER NOT NULL, state TEXT NOT NULL,
-              groups_json TEXT NOT NULL, users_json TEXT NOT NULL,
               envelope TEXT NOT NULL, manifest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS chunks (
               file_id TEXT NOT NULL, idx INTEGER NOT NULL, digest TEXT NOT NULL,
               PRIMARY KEY(file_id,idx));
         """)
-        self.core_urls = core_urls
-        self.policies: dict[tuple[int, ...], GroupAccessPolicy] = {}
+        self._remove_legacy_access_columns()
+
+    def _remove_legacy_access_columns(self) -> None:
+        """Migrate existing uploads without retaining obsolete recipient data."""
+        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(files)')}
+        if not {'groups_json', 'users_json'} <= columns:
+            return
+        with self.db:
+            self.db.execute('ALTER TABLE files RENAME TO files_with_access')
+            self.db.execute('''CREATE TABLE files (
+              id TEXT PRIMARY KEY, owner TEXT NOT NULL, size INTEGER NOT NULL,
+              expires INTEGER NOT NULL, created INTEGER NOT NULL, state TEXT NOT NULL,
+              envelope TEXT NOT NULL, manifest TEXT NOT NULL)''')
+            self.db.execute('''INSERT INTO files
+              (id,owner,size,expires,created,state,envelope,manifest)
+              SELECT id,owner,size,expires,created,state,envelope,manifest
+              FROM files_with_access''')
+            self.db.execute('DROP TABLE files_with_access')
 
     @contextmanager
     def file_lock(self, file_id: str):
@@ -110,9 +109,6 @@ class FileStore:
     def cleanup(self) -> None:
         with self.lock:
             now = int(time.time())
-            # Bound cached identities over time as well as the number of policies.
-            # File requests recheck membership on the next request after eviction.
-            self.policies.clear()
             expired = self.db.execute("SELECT id FROM files WHERE expires<=? OR state IN ('expired','deleted')", (now,)).fetchall()
         for row in expired:
             file_id = row['id']
@@ -207,30 +203,11 @@ class FileStore:
             raise FileError("NOT_AVAILABLE")
         return row
 
-    def permitted(self, row: sqlite3.Row, user: str) -> None:
-        if row['owner'] == user or user in json.loads(row['users_json']):
-            return
-        groups = tuple(json.loads(row['groups_json']))
-        if not groups:
-            raise FileError("ACCESS_DENIED")
-        with self.lock:
-            policy = self.policies.get(groups)
-            if policy is None:
-                if len(self.policies) >= 64:
-                    self.policies.pop(next(iter(self.policies)))
-                policy = self.policies[groups] = GroupAccessPolicy('groups', groups, self.core_urls)
-        try:
-            policy.authorize(user)
-        except GroupAccessDenied as exc:
-            raise FileError("ACCESS_DENIED") from exc
-        except GroupAccessUnavailable as exc:
-            raise FileError("ACCESS_CHECK_UNAVAILABLE") from exc
-
     @staticmethod
     def describe(row: sqlite3.Row, owner: bool = False) -> dict[str, Any]:
         result = {key: row[key] for key in ('id', 'size', 'expires', 'state', 'manifest')}
         if owner:
-            result.update(envelope=row['envelope'], groups=json.loads(row['groups_json']), users=json.loads(row['users_json']))
+            result['envelope'] = row['envelope']
         return result
 
     def request(self, user: str, data: dict[str, Any]) -> Any:
@@ -261,9 +238,10 @@ class FileStore:
                 raise FileError('INVALID_REQUEST')
             size = integer(data.get('size'), 0, MAX_FILE_SIZE)
             ttl = integer(data.get('ttl'), 60, MAX_EXPIRY)
-            groups, users = access(data.get('access'))
-            if groups and not self.core_urls:
-                raise FileError('GROUP_ACCESS_NOT_CONFIGURED')
+            if 'access' in data:
+                # Do not let an older client imply that an ignored guest list
+                # provides security. It must update to the link-access model.
+                raise FileError('FILE_ACCESS_MODEL_CHANGED')
             encoded(data.get('envelope'), 4096)
             encoded(data.get('manifest'), 2048)
             with self.lock, self.db:
@@ -285,21 +263,21 @@ class FileStore:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
-                self.db.execute('INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?,?)',
-                    (file_id,user,size,now+ttl,now,'uploading',json.dumps(groups),json.dumps(users),data['envelope'],data['manifest']))
+                self.db.execute('INSERT INTO files VALUES (?,?,?,?,?,?,?,?)',
+                    (file_id,user,size,now+ttl,now,'uploading',data['envelope'],data['manifest']))
                 return self.describe(self.row(file_id), True)
         file_id = data.get('id')
         with self.lock:
             initial = self.row(file_id)
-        if op in ('info', 'get'):
-            self.permitted(initial, user)  # Network checks run outside the storage lock.
-        elif initial['owner'] != user:
+        if op not in ('info', 'get') and initial['owner'] != user:
             raise FileError('ACCESS_DENIED')
+        if op == 'access':
+            # Access is now determined once, at the service boundary. Returning
+            # a specific error prevents old clients from presenting a control
+            # that no longer has any effect.
+            raise FileError('FILE_ACCESS_MODEL_CHANGED')
         with self.lock, self.db:
             row = self.row(file_id)
-            # Access edits while checking membership require a fresh request.
-            if row['groups_json'] != initial['groups_json'] or row['users_json'] != initial['users_json']:
-                raise FileError('ACCESS_CHANGED')
             if op == 'delete':
                 self.db.execute("UPDATE files SET state='deleted' WHERE id=?", (file_id,))
                 (self.directory / f'{file_id}.bin').unlink(missing_ok=True)
@@ -317,12 +295,6 @@ class FileStore:
                 if len(indices) > 4096:
                     result['nextIndex'] = indices[4095] + 1
                 return result
-            if op == 'access':
-                groups, users = access(data.get('access'))
-                if groups and not self.core_urls:
-                    raise FileError('GROUP_ACCESS_NOT_CONFIGURED')
-                self.db.execute('UPDATE files SET groups_json=?,users_json=? WHERE id=?', (json.dumps(groups),json.dumps(users),file_id))
-                return {}
             if op == 'finish':
                 received = self.db.execute('SELECT COUNT(*) FROM chunks WHERE file_id=?', (file_id,)).fetchone()[0]
                 if received != count:
@@ -349,7 +321,7 @@ class FileStore:
 
 
 def install_files(server: Any) -> None:
-    store = FileStore(server.config.data_dir / 'files', server.config.core_url_bases)
+    store = FileStore(server.config.data_dir / 'files')
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='file-transfer')
     control_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='file-control')
     slots = threading.BoundedSemaphore(16)

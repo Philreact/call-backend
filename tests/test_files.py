@@ -15,14 +15,13 @@ FILE_ID = 'a'*32
 
 @pytest.fixture
 def store(tmp_path):
-    value = FileStore(tmp_path, ('https://example.invalid',))
+    value = FileStore(tmp_path)
     yield value
     value.db.close()
 
 
 def create(store, **changes):
     data = dict(op='create', id=FILE_ID, size=4, ttl=60,
-                access={'groups': [], 'users': [BOB]},
                 envelope=base64.b64encode(b'opaque-key-envelope').decode(),
                 manifest=base64.b64encode(b'opaque-metadata').decode())
     data.update(changes)
@@ -39,13 +38,15 @@ def ready(store):
     store.request(ALICE, {'op': 'finish', 'id': FILE_ID})
 
 
-def test_owner_list_isolated_and_recipient_never_gets_recovery_envelope(store):
+def test_owner_list_isolated_and_link_holder_never_gets_recovery_envelope(store):
     ready(store)
     assert store.request(BOB, {'op': 'list'}) == []
     assert store.request(ALICE, {'op': 'list'})[0]['envelope']
     assert 'envelope' not in store.request(BOB, {'op': 'info', 'id': FILE_ID})
     assert store.request(BOB, {'op': 'get', 'id': FILE_ID, 'index': 0})['chunk']
-    for op in ('get', 'info', 'delete', 'access', 'status', 'put', 'finish'):
+    assert store.request(MALLORY, {'op': 'info', 'id': FILE_ID})
+    assert store.request(MALLORY, {'op': 'get', 'id': FILE_ID, 'index': 0})['chunk']
+    for op in ('delete', 'access', 'status', 'put', 'finish'):
         with pytest.raises(FileError, match='ACCESS_DENIED'):
             store.request(MALLORY, {'op': op, 'id': FILE_ID, 'index': 0})
 
@@ -59,7 +60,7 @@ def test_upload_resume_is_durable_and_chunks_are_immutable(store):
         put(store, chunk=b'y'*(CHUNK_SIZE+28))
     with pytest.raises(FileError, match='UPLOAD_INCOMPLETE'):
         store.request(ALICE, {'op': 'finish', 'id': FILE_ID})
-    reopened = FileStore(store.directory, store.core_urls)
+    reopened = FileStore(store.directory)
     try:
         assert reopened.request(ALICE, {'op': 'status', 'id': FILE_ID})['received'] == [0]
         put(reopened, index=1)
@@ -82,26 +83,13 @@ def test_expiry_and_deletion_reject_reads_and_remove_bytes(store):
         store.request(BOB, {'op': 'info', 'id': FILE_ID})
 
 
-def test_access_edit_stops_next_chunk(store):
-    ready(store)
-    store.request(ALICE, {'op': 'access', 'id': FILE_ID, 'access': {'users': [ALICE]}})
-    with pytest.raises(FileError, match='ACCESS_DENIED'):
-        store.request(BOB, {'op': 'get', 'id': FILE_ID, 'index': 0})
-
-
-def test_group_access_or_individual_and_fail_closed(store, monkeypatch):
-    from qapp_backend.auth.group_access import GroupAccessPolicy, GroupAccessUnavailable
-    create(store, access={'groups': [1144], 'users': [BOB]})
-    put(store)
-    store.request(ALICE, {'op': 'finish', 'id': FILE_ID})
-    def unavailable(*_):
-        raise GroupAccessUnavailable()
-    monkeypatch.setattr(GroupAccessPolicy, 'authorize', unavailable)
-    assert store.request(BOB, {'op': 'info', 'id': FILE_ID})
-    with pytest.raises(FileError, match='ACCESS_CHECK_UNAVAILABLE'):
-        store.request(MALLORY, {'op': 'info', 'id': FILE_ID})
-    monkeypatch.setattr(GroupAccessPolicy, 'authorize', lambda *_: time.time())
-    assert store.request(MALLORY, {'op': 'info', 'id': FILE_ID})
+def test_old_access_requests_fail_instead_of_implying_false_security(store):
+    with pytest.raises(FileError, match='FILE_ACCESS_MODEL_CHANGED'):
+        create(store, access={'groups': [1144], 'users': [BOB]})
+    create(store)
+    with pytest.raises(FileError, match='FILE_ACCESS_MODEL_CHANGED'):
+        store.request(ALICE, {'op': 'access', 'id': FILE_ID,
+                              'access': {'groups': [1144], 'users': []}})
 
 
 def test_quotas_invalid_inputs_and_traversal(store):
@@ -278,3 +266,37 @@ def test_cleanup_waits_for_inflight_write_and_leaves_no_orphan(store, monkeypatc
     assert not (store.directory / f'{FILE_ID}.bin').exists()
     assert store.db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0] == 0
     assert not store.file_locks
+
+
+def test_legacy_recipient_columns_are_removed_without_losing_files(tmp_path):
+    import sqlite3
+    directory = tmp_path / 'legacy'
+    directory.mkdir()
+    db = sqlite3.connect(directory / 'files.sqlite3')
+    db.executescript('''
+      CREATE TABLE files (
+        id TEXT PRIMARY KEY, owner TEXT NOT NULL, size INTEGER NOT NULL,
+        expires INTEGER NOT NULL, created INTEGER NOT NULL, state TEXT NOT NULL,
+        groups_json TEXT NOT NULL, users_json TEXT NOT NULL,
+        envelope TEXT NOT NULL, manifest TEXT NOT NULL);
+      CREATE TABLE chunks (
+        file_id TEXT NOT NULL, idx INTEGER NOT NULL, digest TEXT NOT NULL,
+        PRIMARY KEY(file_id,idx));
+    ''')
+    db.execute('INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?,?)', (
+        FILE_ID, ALICE, 4, int(time.time()) + 60, int(time.time()), 'ready',
+        '[1144]', f'["{BOB}"]', 'opaque-envelope', 'opaque-manifest'))
+    db.execute('INSERT INTO chunks VALUES (?,?,?)', (FILE_ID, 0, 'digest'))
+    db.commit()
+    db.close()
+    (directory / f'{FILE_ID}.bin').write_bytes(b'x' * 32)
+
+    migrated = FileStore(directory)
+    try:
+        columns = {row['name'] for row in migrated.db.execute(
+            'PRAGMA table_info(files)')}
+        assert 'groups_json' not in columns and 'users_json' not in columns
+        assert migrated.request(BOB, {'op': 'info', 'id': FILE_ID})['manifest'] == 'opaque-manifest'
+        assert migrated.db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0] == 1
+    finally:
+        migrated.db.close()
