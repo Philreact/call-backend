@@ -23,6 +23,7 @@ from qapp_backend.auth.group_access import GroupAccessDenied, GroupAccessUnavail
 CHUNK_SIZE = 32768
 MAX_FILE_SIZE = 3 * 1024 * 1024 * 1024
 MAX_EXPIRY = 86400
+MAX_ACTIVE_FILES_PER_OWNER = 2
 OWNER_QUOTA = MAX_FILE_SIZE
 GLOBAL_QUOTA = 10 * 1024 * 1024 * 1024
 CLEANUP_INTERVAL = 300
@@ -330,11 +331,16 @@ class FileStore:
                     if row['owner'] != user or row['envelope'] != data['envelope']:
                         raise FileError('UPLOAD_CONFLICT')
                     return self.describe(row, True)
+                now = int(time.time())
+                active = self.db.execute(
+                    "SELECT COUNT(*) FROM files WHERE owner=? AND state IN ('uploading','ready') AND expires>?",
+                    (user, now)).fetchone()[0]
+                if active >= MAX_ACTIVE_FILES_PER_OWNER:
+                    raise FileError('ACTIVE_FILE_LIMIT')
                 totals = self.db.execute("SELECT COUNT(*),COALESCE(SUM(size),0) FROM files WHERE state IN ('uploading','ready')").fetchone()
                 own = self.db.execute("SELECT COUNT(*),COALESCE(SUM(CASE WHEN state IN ('uploading','ready') THEN size ELSE 0 END),0) FROM files WHERE owner=? AND state!='deleted'", (user,)).fetchone()
                 if totals[0] >= 1000 or own[0] >= 100 or totals[1]+size > GLOBAL_QUOTA or own[1]+size > OWNER_QUOTA:
                     raise FileError('STORAGE_FULL')
-                now = int(time.time())
                 self.native_writes.pop(file_id, None)
                 with (self.directory / f'{file_id}.bin').open('xb'):
                     pass

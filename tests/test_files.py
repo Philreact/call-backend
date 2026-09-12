@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from qapp_backend.files import FileStore, FileError, CHUNK_SIZE, OWNER_QUOTA, MAX_FILE_SIZE, MAX_EXPIRY
+from qapp_backend.files import (FileStore, FileError, CHUNK_SIZE, OWNER_QUOTA,
+                                MAX_FILE_SIZE, MAX_EXPIRY,
+                                MAX_ACTIVE_FILES_PER_OWNER)
 
 ALICE = 'Q' + 'A'*33
 BOB = 'Q' + 'B'*33
@@ -103,6 +105,28 @@ def test_quotas_invalid_inputs_and_traversal(store):
         create(store, id='b'*32)
     with pytest.raises(FileError):
         store.request(ALICE, {'op': 'get', 'id': '../files.sqlite3'})
+
+
+def test_owner_has_at_most_two_non_expired_file_links(store):
+    assert MAX_ACTIVE_FILES_PER_OWNER == 2
+    create(store)
+    create(store, id='b'*32)
+    # A lost create response can be retried without consuming another slot.
+    assert create(store)['id'] == FILE_ID
+    with pytest.raises(FileError, match='ACTIVE_FILE_LIMIT'):
+        create(store, id='c'*32)
+
+    store.request(ALICE, {'op': 'delete', 'id': FILE_ID})
+    assert create(store, id='c'*32)
+
+
+def test_expired_link_does_not_consume_active_link_slot(store):
+    create(store)
+    create(store, id='b'*32)
+    with store.db:
+        store.db.execute('UPDATE files SET expires=? WHERE id=?',
+                         (int(time.time())-1, FILE_ID))
+    assert create(store, id='c'*32)
 
 
 def test_three_gib_and_day_boundaries_and_bounded_resume(store):
