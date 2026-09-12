@@ -239,6 +239,7 @@ class PrivateTransportService:
                 "reliable": True,
                 "datagrams": True,
                 "moqt": purpose == "realtime",
+                "moqtReliableGroups": purpose == "realtime",
             },
         }
 

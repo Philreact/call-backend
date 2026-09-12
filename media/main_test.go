@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -327,6 +328,17 @@ func TestTwoAuthenticatedClientsBlindForwardDatagram(t *testing.T) {
 	if string(object.Payload) != string(ciphertext) ||
 		object.ForwardingPreference != moqtransport.ObjectForwardingPreferenceDatagram {
 		t.Fatalf("unexpected forwarded object: %#v", object)
+	}
+	// Whole encrypted objects use reliable subgroups on the same connection.
+	large := bytes.Repeat([]byte{42}, 150_000)
+	if err := alicePublication.SendGroupObject(moqtransport.Object{GroupID: 5, ObjectID: 1, Payload: large},
+		moqtransport.DeliveryPolicy{Priority: 1, MaxQueueAgeMillis: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	whole, err := bobSubscription.ReadObject(ctx)
+	if err != nil || !bytes.Equal(whole.Payload, large) || whole.GroupID != 5 || whole.ObjectID != 1 ||
+		whole.ForwardingPreference != moqtransport.ObjectForwardingPreferenceSubgroup {
+		t.Fatalf("whole-object forwarding failed: %v", err)
 	}
 	for _, track := range []string{"screen", "feedback"} {
 		sub, subscribeErr := bob.Subscribe(ctx, namespace(grant{RoomID: "proof-room", ParticipantID: "Alice123"}), track)

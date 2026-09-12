@@ -207,7 +207,21 @@ class CallService:
                 raise ValueError("leave the current call before joining another")
             room = self._rooms.get(room_id)
             if room is None or room.expires_at_ms <= int(time.time() * 1000):
-                raise ValueError("call room is unavailable")
+                # An invitation can outlive its in-memory room after the host
+                # leaves, the room expires, or the service restarts. Return a
+                # terminal, request-bound result instead of leaving the Q-App
+                # waiting indefinitely. Keep the reason deliberately generic
+                # so this does not become a room-existence oracle.
+                self._safe_send(
+                    ctx.session,
+                    {
+                        "type": "call_join_rejected",
+                        "requestId": request_id,
+                        "roomId": room_id,
+                        "code": "CALL_UNAVAILABLE",
+                    },
+                )
+                return
             if not hmac.compare_digest(
                 hashlib.sha256(invite_token).digest(), room.invite_token_hash
             ):

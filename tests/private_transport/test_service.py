@@ -127,6 +127,7 @@ def test_realtime_bootstrap_requires_room_and_writes_one_time_media_grant(config
         assert descriptor["backendTransportEndpoint"] == "127.0.0.1:4446"
         assert descriptor["applicationProtocol"] == "moqt-18"
         assert descriptor["supportedFeatures"]["moqt"] is True
+        assert descriptor["supportedFeatures"]["moqtReliableGroups"] is True
         digest = sha256(descriptor["attachToken"].encode("ascii")).hexdigest()
         grant_path = server.config.call_media_grants_path / f"{digest}.json"
         assert server.private_transport.tokens.outstanding(session.session_id) == 0

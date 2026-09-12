@@ -138,6 +138,31 @@ def test_join_requires_the_invitation_secret() -> None:
         server.handlers["call_join"](context(bob), invalid)
 
 
+def test_ended_or_expired_invitation_gets_terminal_join_rejection() -> None:
+    server = FakeServer()
+    service = CallService(server)
+    alice = FakeSession("session-alice", "QAlice123")
+    bob = FakeSession("session-bob", "QBob456")
+    create_room(server, alice)
+
+    service.leave(
+        context(alice),
+        {"type": "call_leave", "requestId": "leave-0001", "roomId": "room-123"},
+    )
+    bob.sent.clear()
+    server.handlers["call_join"](context(bob), join_message())
+
+    assert bob.sent == [
+        {
+            "type": "call_join_rejected",
+            "requestId": "request-0002",
+            "roomId": "room-123",
+            "code": "CALL_UNAVAILABLE",
+        }
+    ]
+    assert not bob.metadata
+
+
 def test_only_initiator_can_deliver_bounded_opaque_group_key() -> None:
     server = FakeServer()
     CallService(server)

@@ -166,11 +166,12 @@ func (s grantStore) consume(token string, now time.Time) (grant, error) {
 }
 
 type subscription struct {
-	request *moqtransport.IncomingSubscribeRequest
-	owner   *connectionHandler
-	queue   chan *moqtransport.Object
-	policy  moqtransport.DeliveryPolicy
-	done    chan struct{}
+	request  *moqtransport.IncomingSubscribeRequest
+	owner    *connectionHandler
+	queue    chan *moqtransport.Object
+	enqueued sync.Map // object pointer -> monotonic enqueue time
+	policy   moqtransport.DeliveryPolicy
+	done     chan struct{}
 }
 
 type broker struct {
@@ -211,7 +212,8 @@ func (b *broker) add(room, participant string, value *subscription, tracks ...st
 		b.subscriptions[key] = set
 	}
 	set[value] = struct{}{}
-	value.queue = make(chan *moqtransport.Object, 64)
+	// At most two complete objects wait per recipient/track (2 MiB).
+	value.queue = make(chan *moqtransport.Object, 2)
 	value.done = make(chan struct{})
 	b.mu.Unlock()
 	go value.forward()
@@ -244,7 +246,11 @@ func (b *broker) publish(source grant, object *moqtransport.Object, tracks ...st
 			return
 		}
 	}
-	if len(object.Payload) == 0 || len(object.Payload) > maxObjectBytes {
+	limit := maxObjectBytes
+	if object.ForwardingPreference == moqtransport.ObjectForwardingPreferenceSubgroup {
+		limit = moqtransport.MaxReliableObjectBytes
+	}
+	if len(object.Payload) == 0 || len(object.Payload) > limit {
 		return
 	}
 	b.mu.RLock()
@@ -273,18 +279,21 @@ func (b *broker) publish(source grant, object *moqtransport.Object, tracks ...st
 		}
 		copyObject := *object
 		copyObject.Payload = append([]byte(nil), object.Payload...)
+		value.enqueued.Store(&copyObject, time.Now())
 		select {
 		case value.queue <- &copyObject:
 		default:
 			// Bound each recipient/track independently. A slow recipient cannot
 			// stall another recipient or a different track.
 			select {
-			case <-value.queue:
+			case discarded := <-value.queue:
+				value.enqueued.Delete(discarded)
 			default:
 			}
 			select {
 			case value.queue <- &copyObject:
 			default:
+				value.enqueued.Delete(&copyObject)
 			}
 		}
 	}
@@ -302,14 +311,17 @@ func (value *subscription) forward() {
 		if object.ForwardingPreference == moqtransport.ObjectForwardingPreferenceDatagram {
 			err = value.request.ScheduleDatagram(*object, value.policy)
 		} else {
-			var subgroup *moqtransport.Subgroup
-			subgroup, err = value.request.OpenSubgroup(object.GroupID, object.SubGroupID, 0)
-			if err == nil {
-				_, err = subgroup.WriteObject(object.ObjectID, object.Payload)
-				_ = subgroup.Close()
+			policy := moqtransport.DeliveryPolicy{Priority: value.policy.Priority, MaxQueueAgeMillis: 1500}
+			if queued, ok := value.enqueued.LoadAndDelete(object); ok {
+				policy.MaxQueueAgeMillis -= int(time.Since(queued.(time.Time)).Milliseconds())
 			}
+			if policy.MaxQueueAgeMillis < 10 {
+				continue
+			}
+			err = value.request.SendGroupObject(*object, policy)
 		}
-		if err != nil && !errors.Is(err, moqtransport.ErrDeliveryQueueFull) {
+		if err != nil && !errors.Is(err, moqtransport.ErrDeliveryQueueFull) &&
+			!errors.Is(err, moqtransport.ErrObjectExpired) {
 			log.Printf("media subscriber send failed: %v", err)
 		}
 	}
