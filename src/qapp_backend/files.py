@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -27,6 +28,29 @@ CLEANUP_INTERVAL = 300
 WRITE_BATCH_DELAY = 0.005
 MAX_PENDING_WRITES = 16
 ID = re.compile(r"^[a-f0-9]{32}$")
+BATCH_CHUNKS = 16
+
+
+def decode_upload_batch(payload: bytes) -> dict[str, Any]:
+    if len(payload) < 22 or len(payload) > 22 + BATCH_CHUNKS * (CHUNK_SIZE + 36) or payload[:4] != b'QFB1':
+        raise FileError('INVALID_REQUEST')
+    count = int.from_bytes(payload[20:22], 'big')
+    if not 1 <= count <= BATCH_CHUNKS:
+        raise FileError('INVALID_REQUEST')
+    chunks = []
+    offset = 22
+    for _ in range(count):
+        if offset + 8 > len(payload):
+            raise FileError('INVALID_REQUEST')
+        index, size = struct.unpack_from('>II', payload, offset)
+        offset += 8
+        if not 28 <= size <= CHUNK_SIZE + 28 or offset + size > len(payload):
+            raise FileError('INVALID_REQUEST')
+        chunks.append((index, payload[offset:offset + size]))
+        offset += size
+    if offset != len(payload):
+        raise FileError('INVALID_REQUEST')
+    return {'op': 'put_batch', 'id': payload[4:20].hex(), 'chunks': chunks}
 
 
 class FileError(ValueError):
@@ -180,6 +204,11 @@ class FileStore:
                     accepted.append(future)
                 except FileError as exc:
                     future.set_exception(exc)
+        self.write_chunks(file_id, writes)
+        for future in accepted:
+            future.set_result({})
+
+    def write_chunks(self, file_id: str, writes: dict[int, tuple[bytes, str]]) -> None:
         if writes:
             # The per-file lock protects deletion/finish/read races, while other
             # files can perform disk I/O concurrently with this sync.
@@ -192,8 +221,42 @@ class FileStore:
             with self.lock, self.db:
                 self.db.executemany('INSERT INTO chunks VALUES (?,?,?)',
                     ((file_id, index, value[1]) for index, value in writes.items()))
-        for future in accepted:
-            future.set_result({})
+    def put_batch(self, user: str, data: dict[str, Any]) -> Any:
+        if not self.write_slots.acquire(blocking=False):
+            raise FileError('BUSY')
+        try:
+            with self.file_lock(data['id']):
+                with self.lock:
+                    row = self.row(data['id'])
+                    if row['owner'] != user:
+                        raise FileError('ACCESS_DENIED')
+                    if row['expires'] <= time.time():
+                        raise FileError('EXPIRED')
+                    if row['state'] != 'uploading':
+                        raise FileError('UPLOAD_CLOSED')
+                    chunks = data.get('chunks')
+                    if not isinstance(chunks, list) or not 1 <= len(chunks) <= BATCH_CHUNKS:
+                        raise FileError('INVALID_REQUEST')
+                    count = max(1, math.ceil(row['size'] / CHUNK_SIZE))
+                    writes = {}
+                    seen = set()
+                    for index, chunk in chunks:
+                        integer(index, 0, count - 1)
+                        if index in seen or not isinstance(chunk, bytes) or len(chunk) != min(CHUNK_SIZE, max(0, row['size'] - index * CHUNK_SIZE)) + 28:
+                            raise FileError('INVALID_CHUNK')
+                        seen.add(index)
+                        digest = hashlib.sha256(chunk).hexdigest()
+                        existing = self.db.execute('SELECT digest FROM chunks WHERE file_id=? AND idx=?', (data['id'], index)).fetchone()
+                        if existing and existing[0] != digest:
+                            raise FileError('CHUNK_CONFLICT')
+                        if not existing:
+                            writes[index] = (chunk, digest)
+                # Validate the complete batch before any write. A single fsync
+                # and index transaction acknowledge all of its immutable chunks.
+                self.write_chunks(data['id'], writes)
+                return {'received': sorted(seen)}
+        finally:
+            self.write_slots.release()
 
     def row(self, file_id: str) -> sqlite3.Row:
         if not isinstance(file_id, str) or not ID.fullmatch(file_id):
@@ -211,6 +274,8 @@ class FileStore:
         return result
 
     def request(self, user: str, data: dict[str, Any]) -> Any:
+        if data.get('op') == 'capabilities':
+            return {'binaryUploadVersion': 1, 'batchChunks': BATCH_CHUNKS, 'maxInFlightBatches': 8}
         if data.get('op') == 'list':
             return self._request(user, data)
         file_id = data.get('id')
@@ -218,6 +283,8 @@ class FileStore:
             raise FileError('INVALID_REQUEST' if data.get('op') == 'create' else 'NOT_AVAILABLE')
         if data.get('op') == 'put':
             return self.put(user, data)
+        if data.get('op') == 'put_batch':
+            return self.put_batch(user, data)
         with self.file_lock(file_id):
             return self._request(user, data)
 
@@ -343,11 +410,12 @@ def install_files(server: Any) -> None:
         executor.shutdown(wait=True)
         control_executor.shutdown(wait=True)
         store.db.close()
+    @server.on_message('file_binary')
     @server.on_message('file_request')
     def handle(ctx: Any, data: Any) -> None:
         if not hasattr(ctx, 'reply') or ctx.lane != 'reliable':
             raise ValueError('files require reliable private transport')
-        bulk = isinstance(data, dict) and data.get('op') in ('put', 'get')
+        bulk = isinstance(data, bytes) or (isinstance(data, dict) and data.get('op') in ('put', 'get', 'put_batch'))
         request_slots = slots if bulk else control_slots
         request_executor = executor if bulk else control_executor
         if not request_slots.acquire(blocking=False):
@@ -359,7 +427,7 @@ def install_files(server: Any) -> None:
                 if session.provisional or not session.authenticated_user or session.expires_at <= time.time() or session.private_transport is not ctx.transport:
                     raise FileError('AUTHENTICATION_REQUIRED')
                 server.authentication_service.require_authorized(session)
-                result = store.request(session.authenticated_user, data)
+                result = store.request(session.authenticated_user, decode_upload_batch(data) if isinstance(data, bytes) else data)
                 if session.private_transport is ctx.transport:
                     ctx.reply({'ok': True, 'result': result})
             except (FileError, GroupAccessDenied, GroupAccessUnavailable) as exc:

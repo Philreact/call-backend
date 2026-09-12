@@ -53,7 +53,7 @@ def test_large_coalesced_delivery_preserves_frames_and_partial_tail(split):
 
 def test_oversized_frame_header_is_rejected_before_buffering_body():
     import struct
-    header = struct.pack('>4sBBHI', b'QP3F', 1, FRAME_RELIABLE, 0, 65537)
+    header = struct.pack('>4sBBHI', b'QP3F', 1, FRAME_RELIABLE, 0, 1024 * 1024 + 1)
     parser = FrameParser()
     with pytest.raises(FramingError, match='inner frame exceeds limit'):
         parser.feed(header + b'x' * 200000)

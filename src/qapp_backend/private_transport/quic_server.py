@@ -80,7 +80,7 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
     def __init__(self, *args: Any, service: "PrivateTransportService", admission: AdmissionQuicServer | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.service = service
-        self.parser = FrameParser()
+        self.parser = FrameParser(max_payload_bytes=64 * 1024)
         self.stream_id: int | None = None
         self._parsers: dict[int, FrameParser] = {}
         self._ended: set[int] = set()
@@ -168,6 +168,9 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
                     )
                 else:
                     raise FramingError("unexpected reliable frame")
+            # Account retained partial frames, not coalesced complete messages.
+            if len(self.parser._buffer) + sum(len(p._buffer) for p in self._parsers.values()) > 4 * 1024 * 1024:
+                raise FramingError('connection partial frame budget exceeded')
             if event.end_stream:
                 if parser._buffer:
                     raise FramingError("incomplete final frame")
@@ -232,6 +235,7 @@ class PrivateQuicProtocol(QuicConnectionProtocol):
         response = {
             "ok": True,
             "reliableStreams": True,
+            "maxReliablePayloadBytes": 1024 * 1024,
             "logicalSessionId": self.session.session_id,
             "transportGeneration": 1,
             "reliable": True,

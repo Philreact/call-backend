@@ -12,7 +12,7 @@ FRAME_ATTACH = 1
 FRAME_ATTACHED = 2
 FRAME_RELIABLE = 3
 MAX_METADATA_BYTES = 4 * 1024
-MAX_RELIABLE_PAYLOAD_BYTES = 64 * 1024
+MAX_RELIABLE_PAYLOAD_BYTES = 1024 * 1024
 MAX_DATAGRAM_PAYLOAD_BYTES = 1024
 MAX_MESSAGE_ID_BYTES = 128
 _STREAM_MAGIC = b"QP3F"
@@ -66,8 +66,9 @@ def encode_frame(frame: Frame) -> bytes:
 
 
 class FrameParser:
-    def __init__(self) -> None:
+    def __init__(self, max_payload_bytes: int = MAX_RELIABLE_PAYLOAD_BYTES) -> None:
         self._buffer = bytearray()
+        self.max_payload_bytes = max_payload_bytes
 
     def feed(self, data: bytes) -> tuple[Frame, ...]:
         # QUIC delivery boundaries are unrelated to application frames. Retain
@@ -89,7 +90,7 @@ class FrameParser:
                 raise FramingError("unsupported inner stream protocol")
             if (
                 metadata_length > MAX_METADATA_BYTES
-                or payload_length > MAX_RELIABLE_PAYLOAD_BYTES
+                or payload_length > self.max_payload_bytes
             ):
                 raise FramingError("inner frame exceeds limit")
             total = _HEADER.size + metadata_length + payload_length

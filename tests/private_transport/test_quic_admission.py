@@ -1,5 +1,9 @@
 import asyncio
 import ssl
+import base64
+import json
+import struct
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -12,6 +16,75 @@ from qapp_backend.private_transport.framing import (
     ALPN, FRAME_ATTACH, FRAME_RELIABLE, Frame, FrameParser, encode_frame, encode_metadata,
 )
 from qapp_backend.private_transport.service import ensure_transport_certificate
+
+
+@pytest.mark.parametrize('binary', [False, True], ids=['legacy-12', 'binary-batch-8'])
+async def test_upload_storage_benchmark(endpoint, tmp_path, binary):
+    """Real loopback QUIC and durable disk writes, with 130ms ACK delay.
+
+    Run pytest -s -k upload_storage_benchmark to inspect throughput. This does
+    not model MASQUE, Hub IPC, or WAN congestion; never treat it as a WAN SLA.
+    """
+    from qapp_backend.files import FileStore, CHUNK_SIZE, decode_upload_batch
+    from qapp_backend.private_transport.service import decode_application_payload
+    server, port, configuration, _ = endpoint
+    store = FileStore(tmp_path / 'benchmark')
+    file_id = 'ab' * 16
+    size = 8 * 1024 * 1024
+    store.request('owner', dict(op='create', id=file_id, size=size, ttl=300,
+        envelope='b3BhcXVl', manifest='b3BhcXVl'))
+    work = set()
+    received = {}
+    async with connect('127.0.0.1', port, configuration=configuration) as client:
+        attach_reader, attach = await client.create_stream()
+        attach.write(encode_frame(Frame(FRAME_ATTACH, encode_metadata({}))))
+        await asyncio.wait_for(attach_reader.read(1024), 1)
+        protocol = next(p for p in server._protocols.values() if p.session is not None)
+        async def dispatch(transport, session, lane, message_id, payload):
+            data = decode_application_payload(payload)
+            result = await asyncio.to_thread(store.request, 'owner', decode_upload_batch(data) if isinstance(data, bytes) else data)
+            await asyncio.sleep(0.130)
+            transport.send_json(lane, message_id, {'ok': True, 'result': result})
+        def handle(*args):
+            task = asyncio.create_task(dispatch(*args))
+            work.add(task)
+            task.add_done_callback(work.discard)
+        protocol.service.handle_application_message = handle
+        reader, writer = await client.create_stream()
+        async def replies():
+            parser = FrameParser()
+            while data := await reader.read(1024 * 1024):
+                for frame in parser.feed(data):
+                    received.pop(frame.metadata_json()['messageId']).set_result(decode_application_payload(frame.payload))
+        reading = asyncio.create_task(replies())
+        semaphore = asyncio.Semaphore(8 if binary else 12)
+        batch = 16 if binary else 1
+        # Already-encrypted-sized bytes: transport/storage timing excludes encryption.
+        chunk = b'x' * (CHUNK_SIZE + 28)
+        async def send(start):
+            async with semaphore:
+                if binary:
+                    payload = b'\x01QFB1' + bytes.fromhex(file_id) + struct.pack('>H', batch) + b''.join(struct.pack('>II', i, len(chunk)) + chunk for i in range(start, start + batch))
+                else:
+                    payload = b'\x00' + json.dumps(dict(op='put', id=file_id, index=start, chunk=base64.b64encode(chunk).decode())).encode()
+                message_id = str(start)
+                future = asyncio.get_running_loop().create_future()
+                received[message_id] = future
+                writer.write(encode_frame(Frame(FRAME_RELIABLE, encode_metadata({'messageId': message_id}), payload)))
+                client.transmit()
+                result = await asyncio.wait_for(future, 20)
+                assert result['ok']
+        started = time.monotonic()
+        try:
+            await asyncio.gather(*(send(i) for i in range(0, size // CHUNK_SIZE, batch)))
+            elapsed = time.monotonic() - started
+            store.request('owner', dict(op='finish', id=file_id))
+            assert len(store.request('owner', dict(op='status', id=file_id))['received']) == size // CHUNK_SIZE
+            print(f'\nUPLOAD_BENCH binary={binary} MiB={size / 1024**2:.0f} seconds={elapsed:.3f} MiB_per_s={size / 1024**2 / elapsed:.2f}')
+        finally:
+            reading.cancel()
+            await asyncio.gather(reading, *work, return_exceptions=True)
+    store.db.close()
 
 
 @pytest.fixture

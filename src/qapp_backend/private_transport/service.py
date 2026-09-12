@@ -450,13 +450,13 @@ class PrivateTransportService:
             if session.private_transport is not transport:
                 raise ValueError("private transport is detached")
             value = decode_application_payload(payload)
-            if not isinstance(value, dict):
+            if not isinstance(value, (dict, bytes)):
                 raise ValueError("private application payload must be an object")
             logical_id = session.metadata.get("qapp_connection_id")
             if not isinstance(logical_id, str):
                 raise ValueError("logical session is unavailable")
-            message_type = value.get("type")
-            if message_type not in DEVELOPMENT_MESSAGE_TYPES:
+            message_type = 'file_binary' if isinstance(value, bytes) else value.get("type")
+            if message_type not in DEVELOPMENT_MESSAGE_TYPES and message_type != 'file_binary':
                 raise ValueError("private application message is unsupported")
             handler = self.server.message_handlers.get(
                 message_type, self.server.message_handlers.get("*")
@@ -482,6 +482,8 @@ def decode_application_payload(payload: bytes) -> Any:
     if not payload:
         raise ValueError("application payload is empty")
     if payload[0] == 0:
+        if len(payload) > 64 * 1024:
+            raise ValueError('JSON application payload exceeds limit')
         try:
             return json.loads(payload[1:].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

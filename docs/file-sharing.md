@@ -54,13 +54,15 @@ external backups.
   10 GiB globally. The expiry maximum applies to newly created links.
 - Maximum 100 records per uploader and 1,000 active records globally.
 - Four file workers with at most 16 queued/running file operations.
-- Uploads start with four chunks in flight and grow to at most twelve on
+- Updated Hub/QApp clients use binary batches of up to 16 encrypted chunks
+  (about 512 KiB), starting with four batches and growing to eight in flight.
+  Legacy clients start with four individual chunks and grow to twelve on
   successful acknowledgements. BUSY responses reduce the window and trigger
   bounded backoff with identical ciphertext; other errors stop the upload.
   Downloads retain four chunks in flight.
 - Owner lists are paged in groups of five; no unbounded list response.
 - Upload-resume status is paginated at 4,096 chunk indices per response, keeping
-  responses below the private channel's 64 KiB message limit even for 3 GiB files.
+  responses below the JSON private channel's 64 KiB limit even for 3 GiB files.
 
 Storage lives in `data_dir/files` (the existing backend Docker volume): a SQLite
 manifest/index and one ciphertext file per upload. On startup, databases from the
@@ -77,23 +79,39 @@ Chunks are immutable and acknowledged only after their bytes are synced to disk
 and the SQLite index transaction is committed with full durability. Concurrent
 upload requests for one file are collected for up to 5 ms and share one file
 sync and index transaction. Batching is bounded to 16 pending chunks across the
-store. Per-file locks coordinate writes, reads, deletion and cleanup; disk reads
+store. Binary batches instead validate all records before writing and share one
+sync/index transaction per batch. Replaying identical ciphertext is idempotent;
+conflicting ciphertext is rejected. Per-file locks coordinate writes, reads, deletion and cleanup; disk reads
 and upload syncs do not hold the shared metadata lock.
 
 An interrupted uploader selects the original file; its fingerprint is checked
 before only missing chunks are sent. Download retries cache only ciphertext in
 the browser's origin-private filesystem, scoped by account and file ID. Expired
 cache folders are removed on subsequent download activity. Plaintext is streamed
-into a browser-managed Blob for Hub's save operation; no full-file JavaScript
-ArrayBuffer is constructed.
+to Hub's bounded streaming-save operation; no full-file JavaScript ArrayBuffer
+is constructed.
 
 ## Deployment and testing
 
 Deploy the backend and updated QApp together because older QApps still send the
 removed `access` field. Backend restarts interrupt active calls and transfers;
-uploads can resume. The feature uses UDP 4445. No Hub or relay update is required.
+uploads can resume. The feature uses UDP 4445. Faster binary uploads require
+updated Hub with sidecar 0.10.0, backend, and QApp; no relay update is required.
+The QApp checks Hub's binary size capability and the backend's `capabilities`
+operation, falling back to individual chunks when binary upload is unsupported.
 
-Run `uv run pytest tests/test_files.py` and the QApp tests/build. Before release:
+The binary upload format is `QFB1`, a 16-byte file ID, a big-endian uint16 count,
+then 1–16 records of big-endian uint32 index, uint32 byte length, and ciphertext.
+It changes neither encryption nor the stored chunk format. Account/group checks
+precede parsing and dispatch. Large frames are only admitted on authenticated
+keyed streams; unauthenticated/primary frames remain capped at 64 KiB.
+Retained partial frames are additionally bounded to 4 MiB per connection.
+
+Run `uv run pytest tests/test_files.py tests/test_files_binary.py` and the QApp
+tests/build. The `test_upload_storage_benchmark` tests in
+`tests/private_transport/test_quic_admission.py` compare real loopback QUIC and
+durable disk writes with simulated acknowledgement latency; they do not model
+Hub IPC, MASQUE, encryption, or WAN performance. Before release:
 
 1. Upload a file and verify that the form only asks for the file and expiry.
 2. Download using another account allowed by the backend service policy.
