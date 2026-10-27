@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "cryptography>=43,<47",
-  "rns==1.5.2",
+  "rns==1.5.5",
 ]
 
 [project.scripts]
