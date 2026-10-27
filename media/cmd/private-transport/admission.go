@@ -12,12 +12,13 @@ import (
 
 type admissionKey struct{}
 type admissionLease struct {
-	started  time.Time
-	release  func()
-	conn     *quic.Conn
-	extra    uint64
-	closed   bool
-	accepted bool
+	diagnosticOnce sync.Once
+	started        time.Time
+	release        func()
+	conn           *quic.Conn
+	extra          uint64
+	closed         bool
+	accepted       bool
 }
 type admissionGate struct {
 	diagnostics     *transportDiagnostics
@@ -56,7 +57,10 @@ func (g *admissionGate) admit(ctx context.Context, _ *quic.ClientInfo) (context.
 		accepted := lease.accepted
 		g.mu.Unlock()
 		if !accepted {
-			g.diagnostics.record("private_transport_setup_failed", "", "quic_handshake", setupErrorCode(context.Cause(ctx)), lease.started)
+			// Closure can race with listener.Accept even after the handshake succeeds.
+			lease.diagnosticOnce.Do(func() {
+				g.diagnostics.record("private_transport_setup_failed", "", "quic_before_accept", setupErrorCode(context.Cause(ctx)), lease.started)
+			})
 		}
 		release()
 		<-g.active

@@ -201,11 +201,14 @@ Container health alone does not confirm Reticulum gateway connectivity.
 
 The native QUIC backend writes structured setup diagnostics to stderr, collected
 by `docker compose logs backend`. `private_transport_setup_failed` records the
-stage (handshake, admission, attach stream/header/metadata, authorization, grant
+stage (before QUIC accept, admission, attach stream/header/metadata, authorization, grant
 validation or response write), a safe error code and elapsed milliseconds.
 `private_transport_setup_complete` confirms that the attach response was written.
 Failures before an application connection is allocated have an empty connection
 ID. QUIC error codes include whether the error came from the remote peer.
+The `quic_before_accept` stage includes handshake failures and connections closed
+before the application registers them for attachment, even if their handshake succeeded. Each
+connection produces at most one terminal setup record.
 
 These records exclude tokens, raw peer error messages and file contents. Output
 is limited to 120 records per minute; the next emitted record reports how many

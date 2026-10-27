@@ -154,7 +154,9 @@ func (s *server) serve(conn *quic.Conn) {
 			if attachExpired.Load() {
 				code = "ATTACH_TIMEOUT"
 			}
-			d.record("private_transport_setup_failed", id, stage, code, lease.started)
+			lease.diagnosticOnce.Do(func() {
+				d.record("private_transport_setup_failed", id, stage, code, lease.started)
+			})
 		}
 	}
 	idBytes := make([]byte, 16)
@@ -233,7 +235,9 @@ func (s *server) serve(conn *quic.Conn) {
 		return
 	}
 	setupComplete = true
-	d.record("private_transport_setup_complete", id, "ready", "", lease.started)
+	lease.diagnosticOnce.Do(func() {
+		d.record("private_transport_setup_complete", id, "ready", "", lease.started)
+	})
 	_ = primary.SetReadDeadline(time.Time{})
 	slots := make(chan struct{}, 8)
 	var workers sync.WaitGroup

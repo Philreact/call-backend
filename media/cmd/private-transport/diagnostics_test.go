@@ -62,7 +62,7 @@ func TestDiagnosticsRateLimitAndSuppressionAccounting(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.record("private_transport_setup_failed", "", "quic_handshake", "CANCELLED", time.Now())
+			d.record("private_transport_setup_failed", "", "quic_before_accept", "CANCELLED", time.Now())
 		}()
 	}
 	wg.Wait()
@@ -72,7 +72,7 @@ func TestDiagnosticsRateLimitAndSuppressionAccounting(t *testing.T) {
 	d.mu.Lock()
 	d.window = time.Now().Add(-time.Minute)
 	d.mu.Unlock()
-	d.record("private_transport_setup_failed", "", "quic_handshake", "CANCELLED", time.Now())
+	d.record("private_transport_setup_failed", "", "quic_before_accept", "CANCELLED", time.Now())
 	var last map[string]any
 	lines := strings.Split(strings.TrimSpace(output.text()), "\n")
 	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
@@ -99,7 +99,8 @@ func diagnosticTLS(t *testing.T) tls.Certificate {
 
 func TestConnectionSetupDiagnostics(t *testing.T) {
 	for _, tc := range []struct{ name, stage, code string }{
-		{"handshake_rejected", "quic_handshake", "QUIC_TRANSPORT_"},
+		{"handshake_rejected", "quic_before_accept", "QUIC_TRANSPORT_"},
+		{"closed_before_bind", "quic_before_accept", "QUIC_APPLICATION_0_REMOTE_true"},
 		{"invalid_header", "read_attach_header", "INVALID_FRAME"},
 		{"rejected_token", "authorize_attach", "BACKEND_ACCESS_DENIED"},
 		{"expired_grant", "validate_attach_grant", "EXPIRED_ATTACH_GRANT"},
@@ -154,10 +155,19 @@ func TestConnectionSetupDiagnostics(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			served := make(chan struct{})
+			accepted := make(chan struct{})
+			allowBind := make(chan struct{})
+			var bindOnce sync.Once
+			releaseBind := func() { bindOnce.Do(func() { close(allowBind) }) }
+			defer releaseBind()
 			go func() {
 				defer close(served)
 				conn, e := listener.Accept(ctx)
 				if e == nil {
+					close(accepted)
+					if tc.name == "closed_before_bind" {
+						<-allowBind
+					}
 					gate.bind(conn)
 					(&server{control: control, frames: make(chan struct{}, 32), diagnostics: d}).serve(conn)
 				}
@@ -167,7 +177,17 @@ func TestConnectionSetupDiagnostics(t *testing.T) {
 				protocol = "wrong-protocol"
 			}
 			client, err := quic.DialAddr(ctx, listener.Addr().String(), &tls.Config{InsecureSkipVerify: true, NextProtos: []string{protocol}}, &quic.Config{EnableDatagrams: true}) // Ephemeral loopback test certificate.
-			if tc.name != "handshake_rejected" {
+			if tc.name == "closed_before_bind" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-accepted:
+				case <-ctx.Done():
+					t.Fatal("handshake did not complete on server")
+				}
+				client.CloseWithError(0, "secret-token")
+			} else if tc.name != "handshake_rejected" {
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -190,6 +210,14 @@ func TestConnectionSetupDiagnostics(t *testing.T) {
 			deadline := time.Now().Add(3 * time.Second)
 			for output.text() == "" && time.Now().Before(deadline) {
 				time.Sleep(5 * time.Millisecond)
+			}
+			releaseBind()
+			if tc.name == "closed_before_bind" {
+				select {
+				case <-served:
+				case <-ctx.Done():
+					t.Fatal("closed connection was not served")
+				}
 			}
 			if client != nil {
 				client.CloseWithError(0, "")
