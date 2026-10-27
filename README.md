@@ -178,6 +178,25 @@ The helper keeps UPnP leases alive and refreshes the address shared with the
 backend. The backend returns the current reachable address during private
 transport bootstrap. It does not publish a separate backend directory.
 
+## Reticulum gateway discovery
+
+The backend includes LXMF for Reticulum interface discovery. Merge
+`discover_interfaces = Yes` and `autoconnect_discovered_interfaces = 5` into
+the `[reticulum]` section of `/data/reticulum/config` in the `reticulum-data`
+volume. `reticulum.example.conf` supplies a Linux example with public bootstrap
+gateways and a Qortal gateway. Preserve your existing interfaces and identity
+files when updating an existing deployment.
+
+Discovery adds at most five automatic connections in addition to configured
+interfaces and persists learned gateways across restarts. At least one
+bootstrap gateway must be reachable to receive the first announcements.
+Public discovery does not require a shared community identity; encrypted
+community announcements additionally require its `network_identity` setting.
+
+After updating the config and rebuilding the image, restart the backend once
+and inspect `docker compose exec backend rnstatus --config /data/reticulum`.
+Container health alone does not confirm Reticulum gateway connectivity.
+
 ## Local development
 
 ```bash

@@ -222,6 +222,17 @@ wheels = [
 ]
 
 [[package]]
+name = "lxmf"
+version = "0.9.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rns" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/b1/1f06fdfe6e6366781625802102b77180645fc9c04a358bc899ace7a07e31/lxmf-0.9.4-py3-none-any.whl", hash = "sha256:72debace801dec8b2c841ee3475fce36b7b00ea8e259822e15557ddfddc1e464", size = 62636, upload-time = "2026-01-06T20:36:04.058Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.3"
 source = { registry = "https://pypi.org/simple" }
@@ -354,6 +365,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
+    { name = "lxmf" },
     { name = "rns" },
 ]
 
@@ -367,6 +379,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=43,<47" },
+    { name = "lxmf", specifier = "==0.9.4" },
     { name = "rns", specifier = "==1.5.5" },
 ]
 
