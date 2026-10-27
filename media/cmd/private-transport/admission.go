@@ -12,13 +12,15 @@ import (
 
 type admissionKey struct{}
 type admissionLease struct {
-	started time.Time
-	release func()
-	conn    *quic.Conn
-	extra   uint64
-	closed  bool
+	started  time.Time
+	release  func()
+	conn     *quic.Conn
+	extra    uint64
+	closed   bool
+	accepted bool
 }
 type admissionGate struct {
+	diagnostics     *transportDiagnostics
 	pending, active chan struct{}
 	mu              sync.Mutex
 	extra           uint64
@@ -26,19 +28,21 @@ type admissionGate struct {
 }
 
 func newAdmissionGate() *admissionGate {
-	return &admissionGate{pending: make(chan struct{}, 256), active: make(chan struct{}, 256), connections: make(map[*quic.Conn]*admissionLease)}
+	return &admissionGate{diagnostics: diagnostics, pending: make(chan struct{}, 256), active: make(chan struct{}, 256), connections: make(map[*quic.Conn]*admissionLease)}
 }
 func (g *admissionGate) retry(net.Addr) bool { return len(g.pending) >= 64 }
 func (g *admissionGate) admit(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
 	select {
 	case g.active <- struct{}{}:
 	default:
+		g.diagnostics.record("private_transport_setup_failed", "", "admission", "CONNECTION_CAPACITY", time.Now())
 		return nil, errors.New("connection capacity")
 	}
 	select {
 	case g.pending <- struct{}{}:
 	default:
 		<-g.active
+		g.diagnostics.record("private_transport_setup_failed", "", "admission", "PENDING_CAPACITY", time.Now())
 		return nil, errors.New("pending capacity")
 	}
 	var once sync.Once
@@ -49,7 +53,11 @@ func (g *admissionGate) admit(ctx context.Context, _ *quic.ClientInfo) (context.
 		lease.closed = true
 		g.extra -= lease.extra
 		delete(g.connections, lease.conn)
+		accepted := lease.accepted
 		g.mu.Unlock()
+		if !accepted {
+			g.diagnostics.record("private_transport_setup_failed", "", "quic_handshake", setupErrorCode(context.Cause(ctx)), lease.started)
+		}
 		release()
 		<-g.active
 	})
@@ -59,6 +67,7 @@ func (g *admissionGate) bind(conn *quic.Conn) {
 	lease := conn.Context().Value(admissionKey{}).(*admissionLease)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	lease.accepted = true
 	if !lease.closed {
 		lease.conn = conn
 		g.connections[conn] = lease

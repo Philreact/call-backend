@@ -35,9 +35,10 @@ type frame struct {
 	metadata, payload []byte
 }
 type server struct {
-	control *control
-	files   string
-	frames  chan struct{}
+	control     *control
+	files       string
+	frames      chan struct{}
+	diagnostics *transportDiagnostics
 }
 
 func acquire(ctx context.Context, slots chan struct{}) error {
@@ -138,12 +139,30 @@ func (s *server) application(ctx context.Context, connection, lane, messageID st
 	return append([]byte{0}, result...)
 }
 func (s *server) serve(conn *quic.Conn) {
+	d := s.diagnostics
+	if d == nil {
+		d = diagnostics
+	}
 	ctx := conn.Context()
+	lease := ctx.Value(admissionKey{}).(*admissionLease)
+	stage, code := "connection_id", "RANDOM_SOURCE_FAILED"
+	id := ""
+	setupComplete := false
+	var attachExpired atomic.Bool
+	reportSetup := func() {
+		if !setupComplete {
+			if attachExpired.Load() {
+				code = "ATTACH_TIMEOUT"
+			}
+			d.record("private_transport_setup_failed", id, stage, code, lease.started)
+		}
+	}
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
+		reportSetup()
 		return
 	}
-	id := hex.EncodeToString(idBytes)
+	id = hex.EncodeToString(idBytes)
 	closeConn := func() { _ = conn.CloseWithError(0x102, "application session unavailable") }
 	s.control.mu.Lock()
 	s.control.closers[id] = closeConn
@@ -155,22 +174,33 @@ func (s *server) serve(conn *quic.Conn) {
 		s.control.mu.Unlock()
 		_ = s.control.send(controlMessage{Op: "detach", Connection: id})
 	}()
-	lease := ctx.Value(admissionKey{}).(*admissionLease)
-	attached := guardAttachment(ctx, lease, closeConn)
+	defer reportSetup()
+	attached := guardAttachment(ctx, lease, func() { attachExpired.Store(true); closeConn() })
+	stage = "accept_attach_stream"
 	primary, err := conn.AcceptStream(ctx)
 	if err != nil {
+		code = setupErrorCode(err)
 		return
 	}
+	stage = "read_attach_header"
 	_ = primary.SetReadDeadline(time.Now().Add(10 * time.Second))
 	first, n, err := readHeader(primary)
 	if err != nil || first.kind != 1 || n != 0 {
+		code = "INVALID_ATTACH_FRAME"
+		if err != nil {
+			code = setupErrorCode(err)
+		}
 		return
 	}
+	stage = "read_attach_metadata"
 	if _, err = io.ReadFull(primary, first.metadata); err != nil {
+		code = setupErrorCode(err)
 		return
 	}
+	stage = "authorize_attach"
 	result, err := s.control.call(ctx, controlMessage{Op: "attach", Connection: id, Peer: conn.RemoteAddr().String(), Metadata: json.RawMessage(first.metadata)})
 	if err != nil {
+		code = setupErrorCode(err)
 		_ = writeFrame(primary, 2, []byte(`{"ok":false,"code":"ATTACH_TOKEN_REJECTED","transportGeneration":1,"reliable":true,"datagrams":true}`), nil)
 		select {
 		case <-time.After(50 * time.Millisecond):
@@ -182,14 +212,28 @@ func (s *server) serve(conn *quic.Conn) {
 		LogicalSessionID string `json:"logicalSessionId"`
 		ExpiresAt        int64  `json:"expiresAt"`
 	}
-	if json.Unmarshal(result, &grant) != nil || grant.ExpiresAt <= time.Now().UnixMilli() || !attached() {
+	stage = "validate_attach_grant"
+	if json.Unmarshal(result, &grant) != nil {
+		code = "INVALID_ATTACH_GRANT"
+		return
+	}
+	if grant.ExpiresAt <= time.Now().UnixMilli() {
+		code = "EXPIRED_ATTACH_GRANT"
+		return
+	}
+	if !attached() {
+		code = "ATTACH_DEADLINE_OR_CLOSED"
 		return
 	}
 	go s.watchSession(ctx, id, grant.ExpiresAt, closeConn)
 	metadata, _ := json.Marshal(map[string]any{"ok": true, "logicalSessionId": grant.LogicalSessionID, "transportGeneration": 1, "reliable": true, "datagrams": true, "reliableStreams": true, "maxReliablePayloadBytes": maxPayload})
-	if writeFrame(primary, 2, metadata, nil) != nil {
+	stage = "write_attach_response"
+	if err := writeFrame(primary, 2, metadata, nil); err != nil {
+		code = setupErrorCode(err)
 		return
 	}
+	setupComplete = true
+	d.record("private_transport_setup_complete", id, "ready", "", lease.started)
 	_ = primary.SetReadDeadline(time.Time{})
 	slots := make(chan struct{}, 8)
 	var workers sync.WaitGroup
@@ -401,6 +445,9 @@ func main() {
 	for {
 		conn, err := listener.Accept(ctx)
 		if err != nil {
+			if ctx.Err() == nil {
+				diagnostics.record("private_transport_listener_failed", "", "accept_connection", setupErrorCode(err), time.Now())
+			}
 			break
 		}
 		gate.bind(conn)

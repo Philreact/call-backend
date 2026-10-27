@@ -197,6 +197,21 @@ After updating the config and rebuilding the image, restart the backend once
 and inspect `docker compose exec backend rnstatus --config /data/reticulum`.
 Container health alone does not confirm Reticulum gateway connectivity.
 
+### Private connection diagnostics
+
+The native QUIC backend writes structured setup diagnostics to stderr, collected
+by `docker compose logs backend`. `private_transport_setup_failed` records the
+stage (handshake, admission, attach stream/header/metadata, authorization, grant
+validation or response write), a safe error code and elapsed milliseconds.
+`private_transport_setup_complete` confirms that the attach response was written.
+Failures before an application connection is allocated have an empty connection
+ID. QUIC error codes include whether the error came from the remote peer.
+
+These records exclude tokens, raw peer error messages and file contents. Output
+is limited to 120 records per minute; the next emitted record reports how many
+were suppressed. Packets that never reach this backend cannot produce a backend
+setup record; those cases still require client and relay diagnostics.
+
 ## Local development
 
 ```bash
